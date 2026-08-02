@@ -74,6 +74,50 @@ With the watcher non-recursive on `raw/` only, writes into either
 dedup logic needed. This amends ARCHITECTURE.md §5, applied there
 directly (no longer just proposed here).
 
+### 2.1 Cleanup: `stager.verify_and_clean()`
+
+**Decided.** `stage()` copying into `raw/.sources/` without ever
+touching the original creates a duplication problem: a file dropped at
+the top level of `raw/` (entry point A) stays there forever, sitting
+alongside its own archived copy. Fixing this is a **separate function**,
+`stager.cleanup.verify_and_clean(item, original_path, vault_root,
+storage)` — not folded into `stage()`, not part of the watcher. One
+reason to change each: `stage()` copies, `verify_and_clean()`
+verifies-then-removes, the watcher only observes.
+
+What it does, once `stage()` has returned a `STAGED` item:
+
+1. Hash-compares the `raw/.sources/` archive against `original_path` —
+   confirms the copy is actually complete and correct, not just that
+   `stage()` didn't raise.
+2. On a match, deletes `original_path` — but **only** if it's still
+   sitting at the literal top level of `raw/` (never a file staged from
+   `ingest add ~/Downloads/x.pdf`, which was never under `raw/` to begin
+   with, and never anything already inside `.sources/`/`.staged/`).
+   `raw/.sources/<archived file>` becomes the sole source of truth from
+   this point on — `queue.archive_path` (already persisted by `stage()`)
+   is how future `lint`/`graph`/re-ingest passes reference it, not
+   whatever transient location the original arrived at.
+3. On a **mismatch** — the archive doesn't actually match despite
+   `stage()` not raising — flips the item to `FAILED`
+   (`failed_at_step=STAGED`) and refuses to delete anything. Treated as
+   a genuine correctness failure, not a cleanliness one.
+4. If deletion itself fails (e.g. permissions) after a confirmed match,
+   logs a warning and leaves the item `STAGED` — the archive is already
+   verified intact at that point, so a leftover duplicate in `raw/` is a
+   cleanliness problem, not a correctness one, and shouldn't block the
+   pipeline.
+
+No-ops (returns the item unchanged) in every case where there's nothing
+to do: staging didn't succeed, the original isn't under `raw/`'s top
+level, or it's already gone (safe to call twice). This makes it safe to
+call unconditionally right after `stage()`, in any orchestrator, without
+first checking whether cleanup applies.
+
+**Not yet wired to anything** — built and tested (`tests/test_stager_cleanup.py`)
+against direct calls, but no CLI/watcher orchestrates `stage()` →
+`verify_and_clean()` yet. See §7.
+
 ## 3. State machine
 
 One `queue` row per file, from first contact through completion. Owner
@@ -286,15 +330,14 @@ doesn't need to mirror the `stager`/`ingest` package split internally):
   (where the interrupt is checked, how "finish current step" is
   guaranteed) is a real implementation detail still to work out when
   `run` gets built, not just a config flag.
-- **Does the watcher's drop-zone self-clean?** `stage()` (built this
-  session) always copies from the source file, never moves/deletes it —
-  even when the source is a file the watcher just observed sitting at
-  the top level of `raw/`. That means, today, a watcher-triggered file
-  stays sitting loose at top-level `raw/` forever after being staged,
-  which will look like clutter/an unprocessed item even though it's
-  already safely archived. Defaulted to the safe (non-destructive)
-  behavior since deletion is a one-way door not explicitly decided in
-  this doc — revisit when the watcher itself gets built.
+- ~~Does the watcher's drop-zone self-clean?~~ **Resolved** — see §2.1,
+  `verify_and_clean()`. `stage()` itself still never moves/deletes
+  anything; cleanup is a deliberately separate function.
+- **Who calls `verify_and_clean()`?** It exists and is fully tested, but
+  nothing calls it yet — there's no CLI `ingest add` or watcher handler
+  to compose `stage()` → `verify_and_clean()` in sequence. Whoever builds
+  that orchestration (§9) must call both, in that order; `stage()`
+  succeeding alone leaves the original sitting in `raw/` uncleaned.
 
 ## 8. Required changes before implementation starts
 
@@ -310,22 +353,25 @@ doesn't need to mirror the `stager`/`ingest` package split internally):
    and `vault/manager.py`'s `REQUIRED_DIRS` now seeds `raw/.staged/` on
    `vault create` (existing test `test_create_builds_full_tree` covers it
    generically, no test changes needed).
-5. ~~`src/llm_wiki/stager/` — new package~~ — **done** (`stage()` only —
-   see §9 build order item 1, this is step 1 of the pipeline, nothing
-   past `STAGED`/`FAILED`).
+5. ~~`src/llm_wiki/stager/` — new package~~ — **done**: `stage()` +
+   `verify_and_clean()` (§2.1), both step-1-only (`STAGED`/`FAILED`,
+   nothing past that). Nothing calls `verify_and_clean()` yet — see §7.
 
 ## 9. Suggested build order
 
-1. ~~`stager.stage()` — filesystem copy/archive + `STAGED`/`FAILED`~~ —
-   **done**, `src/llm_wiki/stager/stager.py`, 4 tests, all passing.
-   Always copies from the source, never moves/deletes it — see the new
-   open decision in §7 (does the watcher's drop-zone self-clean?).
+1. ~~`stager.stage()` + `stager.verify_and_clean()`~~ — **done**,
+   `src/llm_wiki/stager/{stager,cleanup,_repo}.py`, 10 tests, all
+   passing. `stage()` always copies, never moves/deletes; cleanup is the
+   separate function that verifies-then-removes (§2.1). Not yet composed
+   by anything — see §7.
 2. `ingest` steps 2–3 (`QUEUED` → `PARSING` → `PARSED`) — atomize
    plaintext/Markdown only. Still no LLM dependency.
 3. `wiki-cli ingest add/list/status/step/run`, including the pool +
    `--count`/`--status` batch selection (§4, §5), against the above (no
    commit yet) — proves the state machine and resumability contract
-   end-to-end before the LLM steps or `vcs` exist.
+   end-to-end before the LLM steps or `vcs` exist. This is also where
+   `stage()` → `verify_and_clean()` finally get composed (§7) — `add`
+   should call both.
 4. `ingest` steps 4–5 (`ANALYZING`/`CASCADING`) — depends on `llm`
    (not started). Mocked LLM client for tests per ARCHITECTURE.md §11.
    Cascade note writes built atomic (write-temp-then-rename) from the

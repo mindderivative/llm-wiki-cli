@@ -57,7 +57,7 @@ before any interface (CLI/MCP/GUI). No cloud LLM SDKs — local
 
 ## What's built so far
 
-All under `src/llm_wiki/`, with tests in `tests/`. **30/30 tests passing**
+All under `src/llm_wiki/`, with tests in `tests/`. **36/36 tests passing**
 against the real `~/pyDev/venv` interpreter as of this session.
 
 | Module | File(s) | Status |
@@ -67,7 +67,7 @@ against the real `~/pyDev/venv` interpreter as of this session.
 | `models` | `models.py` | Done — `QueueItem` (10-value `QueueStatus`, `failed_at_step`, defaults to `STAGED`), `Note`, `Chunk`, `Link`, `LintFinding` (mirror §6 SQLite schema); typed exception hierarchy (`VaultNotFoundError`, `StorageError`, `IngestionError`, etc.); public `utcnow()` helper |
 | `storage` | `storage/schema.py`, `storage/engine.py` | Done — `StorageEngine`: connect/init_schema/rebuild/close, best-effort `sqlite-vec` loading (degrades gracefully if unavailable), FK + CHECK constraints on `chunks` verified against real SQLite. `queue` table has `failed_at_step`, schema version 2 |
 | `vault` | `vault/manager.py` | Done — `VaultManager`: create/load/validate vault trees, seeds `wiki/index.md`/`log.md`/`SCHEMA.md`, wires in `StorageEngine` on create, cross-vault recent-vaults list (path injectable for tests). `REQUIRED_DIRS` now includes `raw/.staged/` |
-| `stager` | `stager/stager.py` | **New this session** — `stage(source_path, vault_root, storage)`: copies (never moves/deletes) into `raw/.sources/` + `raw/.staged/`, records `STAGED`/`FAILED` as a `queue` row. Step 1 of the pipeline only — see `INGEST_PLAN.md`. 4 tests |
+| `stager` | `stager/{stager,cleanup,_repo}.py` | Done — `stage()`: copies (never moves/deletes) into `raw/.sources/` + `raw/.staged/`, records `STAGED`/`FAILED`. `verify_and_clean()`: hash-verifies the archive, deletes the now-redundant original from `raw/`'s top level, flips to `FAILED` on mismatch. Deliberately separate functions (SRP), **not composed by anything yet** — no CLI/watcher calls either. Step 1 of the pipeline only — see `INGEST_PLAN.md` §2.1. 10 tests |
 | CLI (vault only) | `cli.py`, `__main__.py` | Done, manually smoke-tested, **no automated tests yet** — thin `typer` wrapper exposing `vault create/info/validate/list-recent/forget`. Run via `python -m llm_wiki ...`; not a `[project.scripts]` entry point (see gotcha below). **No `ingest`/`stager` CLI commands yet** — `stage()` only has direct Python-API test coverage so far |
 
 Not started: `ingest` (steps 2–6), `llm`, `compiler`, `graph`, `lint`,
@@ -182,6 +182,38 @@ Picked up exactly where the previous session left off — the three
 - `wiki-cli vault create`/`validate` re-smoke-tested after the model/schema
   changes — still clean.
 
+## Session: stager cleanup — verify_and_clean()
+
+User flagged the open gap from last session (stage()'s drop-zone
+duplication) and specified the fix directly: hash-verify the archive
+against the original, then delete the original, as its own SOLID/SRP
+function separate from both `stage()` and the (still nonexistent)
+watcher. **36/36 tests passing** (was 30, +6).
+
+- `src/llm_wiki/stager/cleanup.py` (new): `verify_and_clean(item,
+  original_path, vault_root, storage) -> QueueItem`. Hash-compares
+  `raw/.sources/` archive against `original_path`; deletes
+  `original_path` on a match, but only if it's still sitting at the
+  literal top level of `raw/` (never touches external `ingest add`
+  sources or anything already in `.sources/`/`.staged/`). Mismatch →
+  flips item to `FAILED`/`failed_at_step=STAGED`, refuses to delete.
+  Delete failure after a confirmed match → logged, item stays `STAGED`
+  (archive's already verified intact — a stray duplicate is cosmetic,
+  not a correctness problem). No-ops safely if there's nothing to do,
+  so it's safe to call unconditionally after `stage()`.
+- `src/llm_wiki/stager/_repo.py` (new): factored `QueueItem` <-> `queue`
+  row (de)serialization out of `stager.py`, shared by `stage()`'s insert
+  and `verify_and_clean()`'s update — avoids duplicating the mapping
+  logic across the two now-separate functions.
+- **Deliberately NOT wired together** — `stage()` does not call
+  `verify_and_clean()` internally, and neither is called by anything yet
+  (no CLI/watcher exists). Whoever builds `wiki-cli ingest add` next
+  (§9 item 3) must call both, in sequence — flagged clearly in
+  `INGEST_PLAN.md` §7 so this isn't silently forgotten.
+- `tests/test_stager_cleanup.py` (new, 6 tests): match+delete, no-op for
+  external sources, no-op if already cleaned, no-op for a failed stage,
+  hash-mismatch → FAILED, delete-failure → stays STAGED.
+
 ## Suggested next step
 
 `ingest` steps 2–3 per `INGEST_PLAN.md` §9 build order item 2: accept a
@@ -190,4 +222,5 @@ Picked up exactly where the previous session left off — the three
 — fully testable with `tmp_path` fixtures and mocked/trivial chunking.
 After that, `wiki-cli ingest add/list/status/step/run` (§9 item 3) to
 prove the pool + `--count`/`--status` state machine end-to-end before any
-LLM-dependent steps exist.
+LLM-dependent steps exist — **and remember `add` needs to call both
+`stage()` and `verify_and_clean()`**, not just `stage()`.
