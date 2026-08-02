@@ -7,7 +7,7 @@ losing this database must never lose information, only rebuild time
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # v2: queue.failed_at_step (INGEST_PLAN.md §3)
 
 CREATE_SCHEMA_META = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -22,8 +22,9 @@ CREATE TABLE IF NOT EXISTS queue (
     title TEXT NOT NULL,
     raw_path TEXT NOT NULL,
     archive_path TEXT,
-    status TEXT NOT NULL DEFAULT 'QUEUED',
+    status TEXT NOT NULL DEFAULT 'STAGED',
     error TEXT,
+    failed_at_step TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );

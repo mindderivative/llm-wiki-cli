@@ -25,14 +25,26 @@ def utcnow() -> datetime:
 
 
 class QueueStatus(str, enum.Enum):
-    """Ingestion queue item lifecycle (ARCHITECTURE.md §8 `/wiki-ingest`)."""
+    """Ingestion queue item lifecycle (INGEST_PLAN.md §3 state machine).
 
-    QUEUED = "QUEUED"
-    PARSING = "PARSING"
-    ANALYZING = "ANALYZING"
-    CASCADE = "CASCADE"
-    COMPLETED = "COMPLETED"
-    FAILED = "FAILED"
+    Owned by `stager` through `STAGED`, by `ingest` from `QUEUED` onward.
+    The `-ING` values are pre-work markers only — no committed output
+    backs them yet, so finding one after a crash means "safe to retry
+    from scratch" (INGEST_PLAN.md §3, atomicity contract). `FAILED` is
+    terminal for whichever step raised; see `QueueItem.failed_at_step`
+    for which one, structured rather than parsed out of `error`.
+    """
+
+    STAGED = "STAGED"        # stager: archived + working copy written
+    QUEUED = "QUEUED"        # ingest: staged item accepted
+    PARSING = "PARSING"      # ingest: atomize() in progress
+    PARSED = "PARSED"        # ingest: chunks committed
+    ANALYZING = "ANALYZING"  # ingest: compile() in progress
+    ANALYZED = "ANALYZED"    # ingest: summary + extraction committed
+    CASCADING = "CASCADING"  # ingest: cascade-update in progress
+    CASCADED = "CASCADED"    # ingest: note writes + embeddings committed
+    COMPLETED = "COMPLETED"  # ingest: pipeline finished
+    FAILED = "FAILED"        # either: terminal, see failed_at_step + error
 
 
 class NoteType(str, enum.Enum):
@@ -50,14 +62,22 @@ class NoteType(str, enum.Enum):
 
 
 class QueueItem(BaseModel):
-    """One row of the `queue` table — an in-flight ingestion job."""
+    """One row of the `queue` table — an in-flight ingestion job.
+
+    `status` defaults to `STAGED` — the earliest state a row is actually
+    created in (by `stager`, once a file is safely archived + staged).
+    `failed_at_step` is set alongside `status=FAILED` + `error`, and
+    cleared back to `None` by an explicit `retry` — see
+    INGEST_PLAN.md §3.
+    """
 
     id: int | None = None
     title: str
     raw_path: Path
     archive_path: Path | None = None
-    status: QueueStatus = QueueStatus.QUEUED
+    status: QueueStatus = QueueStatus.STAGED
     error: str | None = None
+    failed_at_step: QueueStatus | None = None
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 

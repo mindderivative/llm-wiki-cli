@@ -286,27 +286,40 @@ doesn't need to mirror the `stager`/`ingest` package split internally):
   (where the interrupt is checked, how "finish current step" is
   guaranteed) is a real implementation detail still to work out when
   `run` gets built, not just a config flag.
+- **Does the watcher's drop-zone self-clean?** `stage()` (built this
+  session) always copies from the source file, never moves/deletes it —
+  even when the source is a file the watcher just observed sitting at
+  the top level of `raw/`. That means, today, a watcher-triggered file
+  stays sitting loose at top-level `raw/` forever after being staged,
+  which will look like clutter/an unprocessed item even though it's
+  already safely archived. Defaulted to the safe (non-destructive)
+  behavior since deletion is a one-way door not explicitly decided in
+  this doc — revisit when the watcher itself gets built.
 
 ## 8. Required changes before implementation starts
 
-1. `models.py`: expand `QueueStatus` to the 10-value enum in §3; add
-   `failed_at_step: QueueStatus | None` to `QueueItem`. **Not done yet**
-   — this is a real code change, not just doc/scaffold, deferred to
-   actual `ingest` implementation.
-2. `storage/schema.py`: add `failed_at_step TEXT` column to
-   `CREATE_QUEUE`. **Not done yet**, same reason as above.
+1. ~~`models.py`: expand `QueueStatus` to the 10-value enum~~ — **done**.
+   `QueueItem.failed_at_step: QueueStatus | None` added; `status` default
+   changed `QUEUED` → `STAGED` (the actual earliest state a row is
+   created in now).
+2. ~~`storage/schema.py`: add `failed_at_step TEXT` column~~ — **done**.
+   `CREATE_QUEUE`'s `status` default also updated to `'STAGED'`.
+   `SCHEMA_VERSION` bumped 1 → 2 to mark the shape change.
 3. ~~`ARCHITECTURE.md` §3/§7: add `stager` as its own package~~ — **done**.
 4. ~~`ARCHITECTURE.md` §5: apply the `.staged/` layout change~~ — **done**,
    and `vault/manager.py`'s `REQUIRED_DIRS` now seeds `raw/.staged/` on
    `vault create` (existing test `test_create_builds_full_tree` covers it
    generically, no test changes needed).
-5. `src/llm_wiki/stager/` — new package, still doesn't exist. First real
-   build target.
+5. ~~`src/llm_wiki/stager/` — new package~~ — **done** (`stage()` only —
+   see §9 build order item 1, this is step 1 of the pipeline, nothing
+   past `STAGED`/`FAILED`).
 
 ## 9. Suggested build order
 
-1. `stager.stage()` — filesystem copy/archive + `STAGED`/`FAILED`. Fully
-   testable with `tmp_path` fixtures, no LLM or watcher involved.
+1. ~~`stager.stage()` — filesystem copy/archive + `STAGED`/`FAILED`~~ —
+   **done**, `src/llm_wiki/stager/stager.py`, 4 tests, all passing.
+   Always copies from the source, never moves/deletes it — see the new
+   open decision in §7 (does the watcher's drop-zone self-clean?).
 2. `ingest` steps 2–3 (`QUEUED` → `PARSING` → `PARSED`) — atomize
    plaintext/Markdown only. Still no LLM dependency.
 3. `wiki-cli ingest add/list/status/step/run`, including the pool +

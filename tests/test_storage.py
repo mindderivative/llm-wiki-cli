@@ -36,7 +36,7 @@ def test_init_schema_is_idempotent(tmp_path: Path):
         storage.init_schema()
         storage.init_schema()  # must not raise on a second call
         version = storage.conn.execute("SELECT version FROM schema_meta;").fetchone()["version"]
-        assert version == 1
+        assert version == 2
 
 
 def test_rebuild_empties_tables(tmp_path: Path):
@@ -67,6 +67,25 @@ def test_context_manager_closes_connection(tmp_path: Path):
         s.init_schema()
     with pytest.raises(StorageError):
         _ = storage.conn
+
+
+def test_queue_table_has_failed_at_step_column(tmp_path: Path):
+    with StorageEngine(tmp_path / "db.sqlite3") as storage:
+        storage.init_schema()
+        columns = {
+            row["name"]
+            for row in storage.conn.execute("PRAGMA table_info(queue);").fetchall()
+        }
+        assert "failed_at_step" in columns
+
+        # Nullable — a normal (non-failed) row doesn't need to set it.
+        storage.conn.execute(
+            "INSERT INTO queue (title, raw_path, status, created_at, updated_at) "
+            "VALUES ('t', 'raw/.staged/t.md', 'STAGED', '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z');"
+        )
+        storage.conn.commit()
+        row = storage.conn.execute("SELECT failed_at_step FROM queue;").fetchone()
+        assert row["failed_at_step"] is None
 
 
 def test_db_file_created_on_connect(tmp_path: Path):

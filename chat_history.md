@@ -57,20 +57,21 @@ before any interface (CLI/MCP/GUI). No cloud LLM SDKs — local
 
 ## What's built so far
 
-All under `src/llm_wiki/`, with tests in `tests/`. **23/23 tests passing**
+All under `src/llm_wiki/`, with tests in `tests/`. **30/30 tests passing**
 against the real `~/pyDev/venv` interpreter as of this session.
 
 | Module | File(s) | Status |
 |---|---|---|
-| Package scaffold | `pyproject.toml`, `src/llm_wiki/{vault,ingest,llm,compiler,graph,lint,vcs,storage}/__init__.py` | Done — subpackages beyond `storage`/`vault` are docstring-only stubs, not implemented |
+| Package scaffold | `pyproject.toml`, `src/llm_wiki/{vault,stager,ingest,llm,compiler,graph,lint,vcs,storage}/__init__.py` | Done — subpackages beyond `storage`/`vault`/`stager` are docstring-only stubs, not implemented |
 | `config` | `config.py` | Done — `LlamaServerConfig`, `VaultSettings` (load/save `.llm-wiki-config`, derived path properties) |
-| `models` | `models.py` | Done — `QueueItem`, `Note`, `Chunk`, `Link`, `LintFinding` (mirror §6 SQLite schema); typed exception hierarchy (`VaultNotFoundError`, `StorageError`, etc.); public `utcnow()` helper |
-| `storage` | `storage/schema.py`, `storage/engine.py` | Done — `StorageEngine`: connect/init_schema/rebuild/close, best-effort `sqlite-vec` loading (degrades gracefully if unavailable), FK + CHECK constraints on `chunks` verified against real SQLite |
-| `vault` | `vault/manager.py` | Done — `VaultManager`: create/load/validate vault trees, seeds `wiki/index.md`/`log.md`/`SCHEMA.md`, wires in `StorageEngine` on create, cross-vault recent-vaults list (path injectable for tests) |
-| CLI (vault only) | `cli.py`, `__main__.py` | Done, manually smoke-tested, **no automated tests yet** — thin `typer` wrapper exposing `vault create/info/validate/list-recent/forget`. Run via `python -m llm_wiki ...`; not a `[project.scripts]` entry point (see gotcha below) |
+| `models` | `models.py` | Done — `QueueItem` (10-value `QueueStatus`, `failed_at_step`, defaults to `STAGED`), `Note`, `Chunk`, `Link`, `LintFinding` (mirror §6 SQLite schema); typed exception hierarchy (`VaultNotFoundError`, `StorageError`, `IngestionError`, etc.); public `utcnow()` helper |
+| `storage` | `storage/schema.py`, `storage/engine.py` | Done — `StorageEngine`: connect/init_schema/rebuild/close, best-effort `sqlite-vec` loading (degrades gracefully if unavailable), FK + CHECK constraints on `chunks` verified against real SQLite. `queue` table has `failed_at_step`, schema version 2 |
+| `vault` | `vault/manager.py` | Done — `VaultManager`: create/load/validate vault trees, seeds `wiki/index.md`/`log.md`/`SCHEMA.md`, wires in `StorageEngine` on create, cross-vault recent-vaults list (path injectable for tests). `REQUIRED_DIRS` now includes `raw/.staged/` |
+| `stager` | `stager/stager.py` | **New this session** — `stage(source_path, vault_root, storage)`: copies (never moves/deletes) into `raw/.sources/` + `raw/.staged/`, records `STAGED`/`FAILED` as a `queue` row. Step 1 of the pipeline only — see `INGEST_PLAN.md`. 4 tests |
+| CLI (vault only) | `cli.py`, `__main__.py` | Done, manually smoke-tested, **no automated tests yet** — thin `typer` wrapper exposing `vault create/info/validate/list-recent/forget`. Run via `python -m llm_wiki ...`; not a `[project.scripts]` entry point (see gotcha below). **No `ingest`/`stager` CLI commands yet** — `stage()` only has direct Python-API test coverage so far |
 
-Not started: `ingest`, `llm`, `compiler`, `graph`, `lint`, `vcs`. No CLI
-commands exist yet for any of these — only `vault`.
+Not started: `ingest` (steps 2–6), `llm`, `compiler`, `graph`, `lint`,
+`vcs`. No CLI commands exist yet for `stager`/`ingest` — only `vault`.
 
 ## Key decisions made this session
 
@@ -144,17 +145,49 @@ commands exist yet for any of these — only `vault`.
     upgrade — not blocking `ingest`/`stager`.
   - `ARCHITECTURE.md` §3/§7 updated to add `stager` as its own package
     and note `ingest`'s new dependency on `vcs` for batch commits.
-- **Not done yet**, called out explicitly in `INGEST_PLAN.md` §8:
-  `models.py`'s `QueueStatus`/`failed_at_step` changes, `storage/schema.py`'s
-  `failed_at_step` column, and `src/llm_wiki/stager/` itself. These are
-  the actual next implementation steps, not just planning.
+## Session: implemented §8/§9 build-order items 1 (prereqs) and 1 (stager)
+
+Picked up exactly where the previous session left off — the three
+`INGEST_PLAN.md` §8 prerequisites, then `stager.stage()` itself.
+**30/30 tests passing** (was 23; +3 for the model/schema changes, +4 for
+`stager`).
+
+- `models.py`: `QueueStatus` expanded to the full 10-value state machine
+  (`STAGED, QUEUED, PARSING, PARSED, ANALYZING, ANALYZED, CASCADING,
+  CASCADED, COMPLETED, FAILED`), each with an inline comment on who owns
+  it and what it means. `QueueItem.failed_at_step: QueueStatus | None`
+  added. `QueueItem.status` default changed `QUEUED` → `STAGED` (the row
+  now actually gets created at `STAGED` first, by `stager`).
+- `storage/schema.py`: `queue.failed_at_step TEXT` column added (nullable).
+  `queue.status` DDL default updated to `'STAGED'` to match. `SCHEMA_VERSION`
+  bumped 1 → 2 — no real migration logic exists yet (`init_schema` is all
+  `CREATE TABLE IF NOT EXISTS`), this is just marking that the shape
+  changed for whenever migrations become a real thing.
+- `src/llm_wiki/stager/stager.py` (new): `stage(source_path, vault_root,
+  storage) -> QueueItem`. Copies `source_path` into `raw/.sources/`
+  (untouched original, original filename + date prefix) and
+  `raw/.staged/` (working copy, slugified name + date prefix, name
+  collisions resolved with a `-2`/`-3`/... suffix). Always copies, never
+  moves/deletes the source — see the new open decision below. Never
+  raises for staging-domain failures (missing file, I/O error) — returns
+  a `FAILED` + `failed_at_step=STAGED` `QueueItem` instead, per
+  `INGEST_PLAN.md`'s failure contract; only a genuine `StorageError`
+  propagates. 4 tests in `tests/test_stager.py`.
+- **New open decision, added to `INGEST_PLAN.md` §7**: `stage()` never
+  deletes/moves its source, even when the source is a file the watcher
+  observed sitting at top-level `raw/` — meaning that file will sit there
+  forever after being staged, once the watcher exists. Deliberately
+  chose the non-destructive default since deletion is a one-way door;
+  revisit when the watcher actually gets built.
+- `wiki-cli vault create`/`validate` re-smoke-tested after the model/schema
+  changes — still clean.
 
 ## Suggested next step
 
-Start `stager.stage()` per `INGEST_PLAN.md` §9's build order — filesystem
-copy/archive into `.sources/`/`.staged/` + `STAGED`/`FAILED`, fully
-testable with `tmp_path` fixtures, no LLM or watcher needed yet. Do the
-`models.py`/`storage/schema.py` changes from §8 first (10-value enum,
-`failed_at_step` column) since `stager` depends on them. `vcs` (pygit2
-wrapper) can wait until batch-commit wiring per §5/§9 step 5 — not needed
-for the first `stager`/`ingest` milestone.
+`ingest` steps 2–3 per `INGEST_PLAN.md` §9 build order item 2: accept a
+`STAGED` item (`QUEUED`), then `atomize()` into the `chunks` table
+(`PARSING` → `PARSED`), plaintext/Markdown only. Still no `llm` dependency
+— fully testable with `tmp_path` fixtures and mocked/trivial chunking.
+After that, `wiki-cli ingest add/list/status/step/run` (§9 item 3) to
+prove the pool + `--count`/`--status` state machine end-to-end before any
+LLM-dependent steps exist.
