@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.hypothesis/
+dist/
+build/
+*.egg-info/
+
+# Vault-local derived cache (ARCHITECTURE.md §5) — never commit this,
+# it is rebuildable from wiki/ and raw/.
+.llm-wiki/

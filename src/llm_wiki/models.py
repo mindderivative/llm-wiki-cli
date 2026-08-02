@@ -1,0 +1,156 @@
+"""Domain models and typed exceptions shared across CLI/MCP/GUI.
+
+Single source of truth for shapes that cross layer boundaries
+(ARCHITECTURE.md §3, §4). Table-backed models mirror the SQLite schema in
+§6 field-for-field so `storage` can (de)serialize rows without a separate
+DTO layer.
+"""
+
+from __future__ import annotations
+
+import enum
+from datetime import datetime, timezone
+from pathlib import Path
+
+from pydantic import BaseModel, Field
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# --------------------------------------------------------------------------
+# Enums
+# --------------------------------------------------------------------------
+
+
+class QueueStatus(str, enum.Enum):
+    """Ingestion queue item lifecycle (ARCHITECTURE.md §8 `/wiki-ingest`)."""
+
+    QUEUED = "QUEUED"
+    PARSING = "PARSING"
+    ANALYZING = "ANALYZING"
+    CASCADE = "CASCADE"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+class NoteType(str, enum.Enum):
+    """Matches the `wiki/` subdirectories in ARCHITECTURE.md §5."""
+
+    SOURCE = "source"
+    ENTITY = "entity"
+    CONCEPT = "concept"
+    SYNTHESIS = "synthesis"
+
+
+# --------------------------------------------------------------------------
+# Table-backed domain models (ARCHITECTURE.md §6)
+# --------------------------------------------------------------------------
+
+
+class QueueItem(BaseModel):
+    """One row of the `queue` table — an in-flight ingestion job."""
+
+    id: int | None = None
+    title: str
+    raw_path: Path
+    archive_path: Path | None = None
+    status: QueueStatus = QueueStatus.QUEUED
+    error: str | None = None
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
+class Note(BaseModel):
+    """One row of the `notes` table — a Markdown note in `wiki/`.
+
+    `content_hash` gates incremental link/lint passes: a note is only
+    re-parsed if its hash changed since the last run.
+    """
+
+    id: int | None = None
+    path: Path
+    slug: str
+    type: NoteType
+    title: str
+    tags: list[str] = Field(default_factory=list)
+    sources: list[str] = Field(default_factory=list)
+    content_hash: str
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
+class Chunk(BaseModel):
+    """One atomic GEO chunk (`chunks` table). Belongs to exactly one of
+    a queue item (pre-compile) or a note (post-compile)."""
+
+    id: int | None = None
+    note_id: int | None = None
+    queue_item_id: int | None = None
+    ordinal: int
+    title: str
+    content: str
+    word_count: int
+
+
+class Link(BaseModel):
+    """One `[[wikilink]]` edge (`links` table)."""
+
+    source_slug: str
+    target_slug: str
+
+
+class LintFinding(BaseModel):
+    """One issue surfaced by a lint run (`lint_findings` table)."""
+
+    run_id: str
+    slug: str
+    kind: str  # "broken_link" | "schema_violation" | "isolated_note" | ...
+    message: str
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+# --------------------------------------------------------------------------
+# Typed exceptions (ARCHITECTURE.md §10)
+#
+# Engine functions raise these rather than returning None/False on
+# failure, so every interface layer can handle failures explicitly
+# instead of guessing from a falsy return.
+# --------------------------------------------------------------------------
+
+
+class LlmWikiError(Exception):
+    """Base class for all engine-raised errors."""
+
+
+class VaultNotFoundError(LlmWikiError):
+    """Raised when a path does not contain a valid `.llm-wiki-config`."""
+
+
+class VaultAlreadyExistsError(LlmWikiError):
+    """Raised when initializing a vault over an already-initialized one."""
+
+
+class IngestionError(LlmWikiError):
+    """Raised when staging, archiving, or enqueueing a raw source fails."""
+
+
+class CompilationError(LlmWikiError):
+    """Raised when the summarize/extract/cascade pipeline fails."""
+
+
+class LintError(LlmWikiError):
+    """Raised when the lint pipeline itself cannot complete.
+
+    Not to be confused with a `LintFinding` — a finding is an expected
+    result, not a failure of the lint run.
+    """
+
+
+class StorageError(LlmWikiError):
+    """Raised on SQLite/sqlite-vec cache read/write failures."""
+
+
+class GitError(LlmWikiError):
+    """Raised when a pygit2-backed VCS operation fails."""
