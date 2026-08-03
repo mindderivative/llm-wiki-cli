@@ -4,8 +4,10 @@ import pygit2
 import pytest
 from typer.testing import CliRunner
 
+import llm_wiki.cli as cli_module
 from llm_wiki.cli import app
 from llm_wiki.ingest import pipeline as ingest_pipeline
+from llm_wiki.llm.client import ExtractionResult
 from llm_wiki.models import QueueStatus
 from llm_wiki.storage import update_queue_row
 from llm_wiki.vault import VaultManager
@@ -13,20 +15,57 @@ from llm_wiki.vault import VaultManager
 runner = CliRunner()
 
 
-def _fake_complete(item, storage):
-    """Stand-in for the not-yet-built compile()/cascade steps: flips
-    PARSED straight to COMPLETED so run's batch-end commit wiring can be
-    exercised end-to-end before ANALYZING/CASCADING exist (INGEST_PLAN.md
-    §9 build order item 4 is still ahead)."""
+@pytest.fixture(autouse=True)
+def _clear_proxy_env(monkeypatch):
+    """`ingest step`/`run` always construct a real `LlamaClient` now
+    (INGEST_PLAN.md §10) -- just constructing `openai.OpenAI(...)`
+    consults proxy env vars, and this sandbox sets a global SOCKS proxy
+    that httpx can't use without the optional `socksio` package. That's
+    a sandbox artifact, not something LlamaClient's own correctness
+    should depend on -- clear it for every test in this file."""
+    for var in ("ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"):
+        monkeypatch.delenv(var, raising=False)
+
+
+class FakeLlmClient:
+    """Trivial `LlmClient` double so real `compile()` can succeed without
+    a live `llama-server` -- see `with_fake_llm_client` below."""
+
+    def summarize(self, text: str) -> str:
+        return "a summary"
+
+    def extract(self, text: str) -> ExtractionResult:
+        return ExtractionResult(entities=[], concepts=[])
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        raise NotImplementedError
+
+
+@pytest.fixture
+def with_fake_llm_client(monkeypatch):
+    """Monkeypatches `llm_wiki.cli.LlamaClient` (what `_dispatch_table()`
+    constructs) so `ingest step`/`run` drive real `compile()` against a
+    fake client instead of trying to reach an actual `llama-server`."""
+    monkeypatch.setattr(cli_module, "LlamaClient", lambda config: FakeLlmClient())
+
+
+def _fake_cascade(item, storage):
+    """Stand-in for the not-yet-built `cascade()` (INGEST_PLAN.md §10):
+    flips ANALYZED straight to COMPLETED so run's batch-end commit
+    wiring can be exercised end-to-end before cascade() exists.
+    `compile()` (`PARSED` -> `ANALYZED`) is real now -- this only stands
+    in for the one step still missing."""
     completed = item.model_copy(update={"status": QueueStatus.COMPLETED})
     with storage.conn:
         return update_queue_row(storage, completed)
 
 
 @pytest.fixture
-def with_fake_compile_step(monkeypatch):
-    """Registers `_fake_complete` for PARSED for the duration of one test."""
-    monkeypatch.setitem(ingest_pipeline._STEP_FOR_STATUS, QueueStatus.PARSED, _fake_complete)
+def with_fake_cascade_step(monkeypatch):
+    """Registers `_fake_cascade` for ANALYZED for the duration of one
+    test. Safe to combine with `with_fake_llm_client` -- `build_pipeline()`
+    only ever overwrites PARSED/ANALYZING, so this entry survives."""
+    monkeypatch.setitem(ingest_pipeline._STEP_FOR_STATUS, QueueStatus.ANALYZED, _fake_cascade)
 
 
 @pytest.fixture
@@ -78,10 +117,13 @@ def test_list_shows_staged_item(tmp_path: Path, vault_root: Path):
     assert "STAGED" in result.stdout
 
 
-def test_list_status_filter(tmp_path: Path, vault_root: Path):
+def test_list_status_filter(tmp_path: Path, vault_root: Path, with_fake_llm_client):
     _add(vault_root, _write(tmp_path, "good.txt"))
     _add(vault_root, _write(tmp_path, "bad.pdf"))
-    # Drive both to completion (or failure) -- "bad.pdf" isn't a supported format.
+    # Drive both as far as they'll go -- "bad.pdf" isn't a supported
+    # format (fails in atomize()); "good.txt" reaches ANALYZED via the
+    # fake LLM client (cascade() doesn't exist yet, so that's as far as
+    # even a successful item gets -- see INGEST_PLAN.md §10).
     runner.invoke(app, ["ingest", "run", "--count", "AUTO", "--vault", str(vault_root)])
 
     result = runner.invoke(app, ["ingest", "list", "--status", "FAILED", "--vault", str(vault_root)])
@@ -144,17 +186,17 @@ def test_step_requires_exactly_one_of_id_or_count(vault_root: Path):
 # -- run -------------------------------------------------------------------
 
 
-def test_run_explicit_id_to_completion(tmp_path: Path, vault_root: Path):
+def test_run_explicit_id_to_completion(tmp_path: Path, vault_root: Path, with_fake_llm_client):
     _add(vault_root, _write(tmp_path, "note.txt"))
 
     result = runner.invoke(app, ["ingest", "run", "1", "--vault", str(vault_root)])
 
     assert result.exit_code == 0
-    assert "PARSED" in result.stdout  # as far as the pipeline currently goes
+    assert "ANALYZED" in result.stdout  # as far as the pipeline currently goes (§10)
     assert "No commit performed" in result.stdout
 
 
-def test_run_count_auto_drains_pool(tmp_path: Path, vault_root: Path):
+def test_run_count_auto_drains_pool(tmp_path: Path, vault_root: Path, with_fake_llm_client):
     _add(vault_root, _write(tmp_path, "one.txt"))
     _add(vault_root, _write(tmp_path, "two.txt"))
 
@@ -162,7 +204,7 @@ def test_run_count_auto_drains_pool(tmp_path: Path, vault_root: Path):
 
     assert result.exit_code == 0
     list_result = runner.invoke(app, ["ingest", "list", "--vault", str(vault_root)])
-    assert list_result.stdout.count("PARSED") == 2
+    assert list_result.stdout.count("ANALYZED") == 2
 
 
 def test_run_stops_on_failure(tmp_path: Path, vault_root: Path):
@@ -180,7 +222,9 @@ def test_run_stops_on_failure(tmp_path: Path, vault_root: Path):
     assert "STAGED" in status_result.stdout
 
 
-def test_run_commits_completed_items(tmp_path: Path, vault_root: Path, with_fake_compile_step):
+def test_run_commits_completed_items(
+    tmp_path: Path, vault_root: Path, with_fake_llm_client, with_fake_cascade_step
+):
     _add(vault_root, _write(tmp_path, "note.txt"))
 
     result = runner.invoke(app, ["ingest", "run", "--count", "AUTO", "--vault", str(vault_root)])
@@ -193,7 +237,9 @@ def test_run_commits_completed_items(tmp_path: Path, vault_root: Path, with_fake
     assert commits[0].message == "ingest: note"
 
 
-def test_run_commit_message_lists_multiple_titles(tmp_path: Path, vault_root: Path, with_fake_compile_step):
+def test_run_commit_message_lists_multiple_titles(
+    tmp_path: Path, vault_root: Path, with_fake_llm_client, with_fake_cascade_step
+):
     _add(vault_root, _write(tmp_path, "one.txt"))
     _add(vault_root, _write(tmp_path, "two.txt"))
 
@@ -207,7 +253,7 @@ def test_run_commit_message_lists_multiple_titles(tmp_path: Path, vault_root: Pa
 
 
 def test_run_commits_only_items_completed_before_failure(
-    tmp_path: Path, vault_root: Path, with_fake_compile_step
+    tmp_path: Path, vault_root: Path, with_fake_llm_client, with_fake_cascade_step
 ):
     _add(vault_root, _write(tmp_path, "good.txt"))
     _add(vault_root, _write(tmp_path, "bad.pdf"))  # unsupported format -> FAILED
@@ -220,6 +266,32 @@ def test_run_commits_only_items_completed_before_failure(
     commits = list(repo.walk(repo.head.target))
     assert len(commits) == 1
     assert commits[0].message == "ingest: good"  # not "third" -- never attempted
+
+
+def test_run_fails_cleanly_with_no_llama_server_reachable(tmp_path: Path, vault_root: Path):
+    # No with_fake_llm_client here -- a real LlamaClient, pointed at the
+    # vault's default (nothing actually listening) llama.base_url. Once
+    # advance() reaches PARSED, real compile() tries a real HTTP call
+    # and gets a connection error -- confirms that comes back as a
+    # clean FAILED/ANALYZING rather than an unhandled exception/traceback.
+    _add(vault_root, _write(tmp_path, "note.txt"))
+
+    result = runner.invoke(app, ["ingest", "run", "1", "--vault", str(vault_root)])
+
+    assert result.exit_code == 1
+    assert "FAILED" in result.stdout
+    status_result = runner.invoke(app, ["ingest", "status", "1", "--vault", str(vault_root)])
+    assert "ANALYZING" in status_result.stdout  # failed_at_step
+
+
+def test_status_shows_analysis_once_analyzed(tmp_path: Path, vault_root: Path, with_fake_llm_client):
+    _add(vault_root, _write(tmp_path, "note.txt"))
+    runner.invoke(app, ["ingest", "run", "1", "--vault", str(vault_root)])
+
+    result = runner.invoke(app, ["ingest", "status", "1", "--vault", str(vault_root)])
+
+    assert "summary" in result.stdout
+    assert "a summary" in result.stdout
 
 
 def test_run_invalid_count_fails(vault_root: Path):

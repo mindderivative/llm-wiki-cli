@@ -7,7 +7,7 @@ losing this database must never lose information, only rebuild time
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 2  # v2: queue.failed_at_step (INGEST_PLAN.md §3)
+SCHEMA_VERSION = 3  # v3: queue_analysis table (INGEST_PLAN.md §10)
 
 CREATE_SCHEMA_META = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -70,6 +70,16 @@ CREATE_CHUNKS_QUEUE_IDX = """
 CREATE INDEX IF NOT EXISTS idx_chunks_queue_item_id ON chunks (queue_item_id);
 """
 
+CREATE_QUEUE_ANALYSIS = """
+CREATE TABLE IF NOT EXISTS queue_analysis (
+    queue_item_id INTEGER PRIMARY KEY REFERENCES queue (id) ON DELETE CASCADE,
+    summary TEXT NOT NULL,
+    entities TEXT NOT NULL DEFAULT '[]',
+    concepts TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+);
+"""
+
 CREATE_LINKS = """
 CREATE TABLE IF NOT EXISTS links (
     source_slug TEXT NOT NULL,
@@ -115,6 +125,7 @@ CORE_TABLES = (
     CREATE_CHUNKS,
     CREATE_CHUNKS_NOTE_IDX,
     CREATE_CHUNKS_QUEUE_IDX,
+    CREATE_QUEUE_ANALYSIS,
     CREATE_LINKS,
     CREATE_LINT_FINDINGS,
     CREATE_LINT_FINDINGS_RUN_IDX,
@@ -127,6 +138,7 @@ ALL_TABLES_DROP_ORDER = (
     "links",
     "vec_chunks",
     "chunks",
+    "queue_analysis",
     "notes",
     "queue",
     "schema_meta",

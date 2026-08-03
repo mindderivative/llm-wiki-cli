@@ -2,10 +2,27 @@ from pathlib import Path
 
 import pytest
 
-from llm_wiki.ingest import advance, step_once
-from llm_wiki.models import QueueItem, QueueStatus
-from llm_wiki.storage import StorageEngine, insert_queue_row
+from llm_wiki.ingest import advance, build_pipeline, step_once
+from llm_wiki.llm.client import ExtractionResult
+from llm_wiki.models import Chunk, QueueItem, QueueStatus
+from llm_wiki.storage import StorageEngine, insert_chunk_row, insert_queue_row
 from llm_wiki.vault import VaultManager
+
+
+class FakeLlmClient:
+    """Minimal `LlmClient` double -- see test_ingest_compile.py for the
+    fuller version with failure injection. Only used here to prove the
+    dispatcher wires `compile()` in correctly via `build_pipeline()`,
+    not to re-test `compile()`'s own logic."""
+
+    def summarize(self, text: str) -> str:
+        return "a summary"
+
+    def extract(self, text: str) -> ExtractionResult:
+        return ExtractionResult(entities=["Acme Corp"], concepts=[])
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        raise NotImplementedError
 
 
 @pytest.fixture
@@ -58,8 +75,11 @@ def test_step_once_noop_for_terminal_status(vault_root: Path, storage: StorageEn
 
 
 def test_step_once_noop_for_unimplemented_status(vault_root: Path, storage: StorageEngine):
-    # PARSED is a real, valid status -- just nothing's registered to
-    # advance past it yet (compile() doesn't exist).
+    # PARSED is a real, valid status, and compile() exists now -- but
+    # the *default* dispatch table (used when no dispatch_table is
+    # passed) never registers compile(), since it needs an llm_client
+    # nothing here provides. See test_step_once_with_dispatch_table_
+    # drives_compile below for the build_pipeline(llm_client) path.
     item = _item(vault_root, storage, "note.md", QueueStatus.PARSED)
 
     result = step_once(item, storage)
@@ -83,3 +103,47 @@ def test_advance_stops_on_failure_without_raising(vault_root: Path, storage: Sto
 
     assert result.status == QueueStatus.FAILED
     assert result.failed_at_step == QueueStatus.PARSING  # got through accept(), failed in atomize()
+
+
+# -- build_pipeline() / dispatch_table (compile() wiring) --------------------
+
+
+def test_build_pipeline_without_llm_client_omits_compile():
+    table = build_pipeline()
+
+    assert QueueStatus.PARSED not in table
+    assert QueueStatus.ANALYZING not in table
+
+
+def test_build_pipeline_with_llm_client_registers_compile_for_both_statuses():
+    table = build_pipeline(FakeLlmClient())
+
+    assert QueueStatus.PARSED in table
+    assert QueueStatus.ANALYZING in table
+    # Base statuses are still there too -- build_pipeline() extends the
+    # base table, it doesn't replace it.
+    assert QueueStatus.STAGED in table
+
+
+def test_step_once_with_dispatch_table_drives_compile(vault_root: Path, storage: StorageEngine):
+    item = _item(vault_root, storage, "note.md", QueueStatus.PARSED)
+    with storage.conn:
+        insert_chunk_row(
+            storage, Chunk(queue_item_id=item.id, ordinal=0, title="Intro", content="text", word_count=1)
+        )
+    table = build_pipeline(FakeLlmClient())
+
+    result = step_once(item, storage, dispatch_table=table)
+
+    assert result.status == QueueStatus.ANALYZED
+
+
+def test_advance_with_dispatch_table_reaches_analyzed(vault_root: Path, storage: StorageEngine):
+    item = _item(vault_root, storage, "note.txt", QueueStatus.STAGED)
+    table = build_pipeline(FakeLlmClient())
+
+    result = advance(item, storage, dispatch_table=table)
+
+    # STAGED -> QUEUED -> PARSED -> ANALYZED is as far as the pipeline
+    # goes now -- cascade() (-> COMPLETED) isn't built yet (§10).
+    assert result.status == QueueStatus.ANALYZED

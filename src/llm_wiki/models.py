@@ -114,6 +114,24 @@ class Chunk(BaseModel):
     word_count: int
 
 
+class Analysis(BaseModel):
+    """One row of the `queue_analysis` table — `ingest.compile()`'s
+    output (summary + extracted entities/concepts) for one queue item.
+
+    Staged here until `cascade()` (INGEST_PLAN.md §10 — not built yet)
+    reads it and merges it into `wiki/` notes. One row per queue item;
+    a retried `compile()` overwrites it (`INSERT OR REPLACE`) rather
+    than accumulating stale attempts, matching the pipeline's general
+    "redo a step from scratch" recovery convention (§3).
+    """
+
+    queue_item_id: int
+    summary: str
+    entities: list[str] = Field(default_factory=list)
+    concepts: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utcnow)
+
+
 class Link(BaseModel):
     """One `[[wikilink]]` edge (`links` table)."""
 

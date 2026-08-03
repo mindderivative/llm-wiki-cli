@@ -3,13 +3,14 @@ from pathlib import Path
 import pytest
 
 from llm_wiki.models import StorageError
-from llm_wiki.storage import StorageEngine
+from llm_wiki.storage import SCHEMA_VERSION, StorageEngine
 
 CORE_TABLE_NAMES = {
     "schema_meta",
     "queue",
     "notes",
     "chunks",
+    "queue_analysis",
     "links",
     "lint_findings",
 }
@@ -36,7 +37,7 @@ def test_init_schema_is_idempotent(tmp_path: Path):
         storage.init_schema()
         storage.init_schema()  # must not raise on a second call
         version = storage.conn.execute("SELECT version FROM schema_meta;").fetchone()["version"]
-        assert version == 2
+        assert version == SCHEMA_VERSION
 
 
 def test_rebuild_empties_tables(tmp_path: Path):

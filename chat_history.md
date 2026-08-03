@@ -57,23 +57,25 @@ before any interface (CLI/MCP/GUI). No cloud LLM SDKs — local
 
 ## What's built so far
 
-All under `src/llm_wiki/`, with tests in `tests/`. **89/89 tests passing**
+All under `src/llm_wiki/`, with tests in `tests/`. **119/119 tests passing**
 against the real `~/pyDev/venv` interpreter as of this session.
 
 | Module | File(s) | Status |
 |---|---|---|
-| Package scaffold | `pyproject.toml`, `src/llm_wiki/{vault,stager,ingest,llm,compiler,graph,lint,vcs,storage}/__init__.py` | Done — subpackages beyond `storage`/`vault`/`stager`/`ingest`/`vcs` are docstring-only stubs, not implemented |
+| Package scaffold | `pyproject.toml`, `src/llm_wiki/{vault,stager,ingest,llm,compiler,graph,lint,vcs,storage}/__init__.py` | Done — subpackages beyond `storage`/`vault`/`stager`/`ingest`/`vcs`/`llm` are docstring-only stubs, not implemented |
 | `config` | `config.py` | Done — `LlamaServerConfig`, `VaultSettings` (load/save `.llm-wiki-config`, derived path properties) |
-| `models` | `models.py` | Done — `QueueItem` (10-value `QueueStatus`, `failed_at_step`, defaults to `STAGED`), `Note`, `Chunk`, `Link`, `LintFinding` (mirror §6 SQLite schema); typed exception hierarchy (`VaultNotFoundError`, `StorageError`, `IngestionError`, `GitError`, etc.); public `utcnow()` helper |
-| `storage` | `storage/{schema,engine,queue_repo,chunk_repo}.py` | Done — `StorageEngine`: connect/init_schema/rebuild/close, best-effort `sqlite-vec` loading, FK + CHECK constraints verified against real SQLite. `queue` table has `failed_at_step`, schema version 2. `queue_repo`/`chunk_repo`: shared row (de)serialization for `stager`+`ingest`, no internal `.commit()` (callers wrap writes in `with storage.conn:`). `queue_repo` also has `get_queue_row`/`list_queue_rows`/`list_pool` (the pool query: non-terminal items, oldest first, optional status filter) |
-| `vault` | `vault/manager.py` | Done — `VaultManager`: create/load/validate vault trees, seeds `wiki/index.md`/`log.md`/`SCHEMA.md`, wires in `StorageEngine` on create, cross-vault recent-vaults list (path injectable for tests). `REQUIRED_DIRS` now includes `raw/.staged/`. **Does not `git init` the vault** — that happens lazily, on the first real commit (see `vcs` below) |
-| `stager` | `stager/{stager,cleanup}.py` | Done — `stage()`: copies (never moves/deletes) into `raw/.sources/` + `raw/.staged/`, records `STAGED`/`FAILED`. `verify_and_clean()`: hash-verifies the archive, deletes the now-redundant original from `raw/`'s top level, flips to `FAILED` on mismatch. Deliberately separate functions (SRP) — composed together by `wiki-cli ingest add`. Step 1 of the pipeline only — see `INGEST_PLAN.md` §2.1. 10 tests |
-| `ingest` | `ingest/{accept,atomize,pipeline}.py` | `accept()` (step 2, `STAGED`→`QUEUED`). `atomize()` (step 3, `QUEUED`/`PARSING`→`PARSED`, plaintext/Markdown chunking via `markdown-it-py`'s block tokenizer — `#` inside fenced code blocks correctly ignored). `pipeline.py`: `step_once()`/`advance()`, the generic status→function dispatcher (INGEST_PLAN.md §4) — this is what lets the CLI drive the pipeline without knowing which concrete function handles which status. Nothing registered past `PARSED` yet (`compile()`/cascade don't exist — item 4). 18 tests (12 accept/atomize + 6 dispatcher) |
-| `vcs` | `vcs/engine.py` (**new this session**) | `GitEngine`: `init()` (idempotent — creates the repo + a `.llm-wiki/`-ignoring `.gitignore` if missing, otherwise just opens it) and `commit(message)` (stages `raw/` + `wiki/` via `git add -A` over both, commits, returns the new oid or `None` if nothing actually changed — a no-op, not an error). `push()`/`pull()`/`status()` deliberately not built — INGEST_PLAN.md §9 item 5 scopes this to local commit only. 9 tests |
-| CLI | `cli.py`, `__main__.py` | `vault` group done (smoke-tested only, still no automated tests — flagged tech debt). `ingest` group: `add`, `list`, `status`, `step` (single id or `--count`/`--status` pool batch), `run` (explicit ids or `--count N\|AUTO`, stops on `FAILED`, `--count AUTO` interruptible via Ctrl-C). **`run` now actually commits** (new this session) — batch-end commit via `GitEngine`, covering exactly the items that reached `COMPLETED` during that run, message per INGEST_PLAN.md §5 (`"ingest: <title>"` / `"ingest: N files (...)"`); zero completions → no commit, no repo touched at all. `retry`/`watch` still deliberately not built (see gaps below). 17 CLI tests via `typer.testing.CliRunner`. Run via `python -m llm_wiki ...`; not a `[project.scripts]` entry point (see gotcha below) |
+| `models` | `models.py` | Done — `QueueItem` (10-value `QueueStatus`, `failed_at_step`, defaults to `STAGED`), `Note`, `Chunk`, `Analysis` (new this session — `queue_analysis` row), `Link`, `LintFinding`; typed exception hierarchy (`VaultNotFoundError`, `StorageError`, `IngestionError`, `CompilationError`, `GitError`, etc.); public `utcnow()` helper |
+| `storage` | `storage/{schema,engine,queue_repo,chunk_repo,analysis_repo}.py` | Done — `StorageEngine`: connect/init_schema/rebuild/close, best-effort `sqlite-vec` loading, FK + CHECK constraints verified against real SQLite. Schema version 3 (new this session — `queue_analysis` table). `queue_repo`/`chunk_repo`/`analysis_repo`: shared row (de)serialization, no internal `.commit()` (callers wrap writes in `with storage.conn:`). `chunk_repo` has `list_chunks_for_queue_item` (new — ordered by `ordinal`); `analysis_repo` has `upsert_analysis_row`/`get_analysis_row` (new, `INSERT OR REPLACE`) |
+| `vault` | `vault/manager.py` | Done — `VaultManager`: create/load/validate vault trees, seeds `wiki/index.md`/`log.md`/`SCHEMA.md`, wires in `StorageEngine` on create, cross-vault recent-vaults list (path injectable for tests). **Does not `git init` the vault** — lazy, on first real commit |
+| `stager` | `stager/{stager,cleanup}.py` | Done — `stage()`/`verify_and_clean()`, composed by `wiki-cli ingest add`. Step 1 of the pipeline only. 10 tests |
+| `llm` | `llm/client.py` (**new this session**) | `LlamaClient`: wraps `llama-server`'s OpenAI-compatible endpoint via `openai` (chat + embeddings) and `outlines` (grammar-constrained structured extraction). `LlmClient` — a narrow `Protocol`, not an ABC — is what `ingest.compile()` actually depends on, so tests inject a trivial fake without touching `outlines`/`openai`. `summarize()`, `extract() -> ExtractionResult`, `embed()` (not consumed yet — `cascade()`'s job later). 11 tests, including real `outlines` integration exercised via `MagicMock(spec=openai.OpenAI)` (a bare duck-typed fake fails `outlines.from_openai()`'s real `isinstance` check) |
+| `ingest` | `ingest/{accept,atomize,compile,pipeline}.py` | `accept()` (step 2), `atomize()` (step 3, plaintext/Markdown chunking via `markdown-it-py`). `compile()` (step 4, **new this session** — `PARSED`→`ANALYZING`→`ANALYZED`: reads `atomize()`'s chunks, calls `llm_client.summarize()`/`.extract()`, commits a `queue_analysis` row). `pipeline.py`: `step_once()`/`advance()` dispatcher + `build_pipeline(llm_client)` (**new** — binds `compile()`'s extra dependency in via `functools.partial` without leaking it into `accept()`/`atomize()`'s signatures; omit it and you get the base table, unchanged, so old call sites/tests still work). Nothing registered past `ANALYZED` yet (`cascade()` doesn't exist — item 4b, deliberately deferred). 24 tests (12 accept/atomize + 6 `compile()` + 6 dispatcher) |
+| `vcs` | `vcs/engine.py` | `GitEngine`: `init()` (idempotent) + `commit(message)` (stages `raw/`+`wiki/`, no-ops if nothing changed). `push()`/`pull()`/`status()` deliberately not built. 9 tests |
+| CLI | `cli.py`, `__main__.py` | `vault` group (smoke-tested only). `ingest` group: `add`, `list`, `status` (now shows `summary`/`entities`/`concepts` once `ANALYZED`), `step`, `run` — both `step`/`run` now build a real `LlamaClient` + dispatch table per invocation (`_dispatch_table()`), so `compile()` genuinely runs, no CLI flag needed to opt in. `run` commits via `GitEngine` once anything reaches `COMPLETED` (still can't fire for real — nothing reaches `COMPLETED` until `cascade()` exists). `retry`/`watch` still deliberately not built. 19 CLI tests via `typer.testing.CliRunner` |
 
-Not started: `ingest` steps 4–5 (`compile()`, cascade-update — blocked on
-`llm`), `llm`, `compiler`, `graph`, `lint`, `vcs.push()`/`pull()`/`status()`,
+Not started: `ingest` step 5 (`cascade()`, `ANALYZED`→`COMPLETED` — needs
+`compiler`, deliberately deferred, see this session's summary),
+`compiler`, `graph`, `lint`, `vcs.push()`/`pull()`/`status()`,
 `ingest retry`/`watch`, watcher (`stager.watch()`).
 
 ## Key decisions made this session
@@ -395,19 +397,117 @@ Picked up `INGEST_PLAN.md` §9 build order item 5. **89/89 tests passing**
   `pygit2` directly against the resulting repo (commit count, commit
   message), not just CLI output text.
 
+## Session: llm package + ingest.compile() — step 4a (item 4 split further)
+
+Picked up `INGEST_PLAN.md` §9 item 4. Before writing code: item 4 covers
+two real steps (`compile()` and `cascade()`) and had several genuinely
+open design questions (how much to build this session; how much an LLM
+should be trusted to rewrite existing `wiki/` notes during cascade).
+Asked the user directly rather than guessing — see `INGEST_PLAN.md` §10
+for both answers, locked in: **this session builds `llm` + `compile()`
+only** (`cascade()` deferred to its own session), and **cascade's future
+merge behavior will be append-only** (LLM only ever proposes new content
+under a dated subsection; existing note text is never sent back through
+the LLM for rewriting — chosen for auditability, since a full rewrite
+can't distinguish LLM output from a human's manual edits). **119/119
+tests passing** (was 89; +30).
+
+- `src/llm_wiki/llm/client.py` (new): `LlamaClient`, `LlmClient`
+  (`Protocol`), `ExtractionResult`. Verified against the *actually
+  installed* `outlines` version in this sandbox (1.x-era API, no
+  `outlines.generate` module) before writing any production code —
+  `outlines.from_openai(client, model)` does a real `isinstance` check
+  (a bare duck-typed fake fails it), and `model(prompt,
+  output_type=SomeModel)` returns a **JSON string**, not an
+  already-parsed instance. Found that `unittest.mock.MagicMock(spec=
+  openai.OpenAI)` passes the isinstance check and is easy to stub on
+  exactly the surface `outlines`' OpenAI backend touches
+  (`chat.completions.create()`, `.choices[i].message.{content,refusal}`)
+  — confirmed working end-to-end in the sandbox first, so `LlamaClient`'s
+  11 tests exercise the *real* `outlines` integration with zero network
+  access, per ARCHITECTURE.md §11.
+- New `queue_analysis` table (`SCHEMA_VERSION` 2→3) + `Analysis` model +
+  `storage/analysis_repo.py` (`upsert_analysis_row`/`get_analysis_row`,
+  `INSERT OR REPLACE` — a retried `compile()` overwrites the previous
+  attempt, same "redo from scratch" convention as everywhere else).
+  `chunk_repo.py` gained `list_chunks_for_queue_item()` (ordered read
+  path) — `compile()` reads `atomize()`'s already-committed chunks
+  rather than re-parsing the raw file.
+- `src/llm_wiki/ingest/compile.py` (new): `compile(item, storage,
+  llm_client)` — step 4, `PARSED`→`ANALYZING`→`ANALYZED`. Same two-phase
+  atomicity pattern as `atomize()` (durable `ANALYZING` marker commits
+  first, chunks-derived text goes to `llm_client.summarize()`/
+  `.extract()`, then `queue_analysis` + `ANALYZED` commit together).
+  Accepts `PARSED` or `ANALYZING` as valid starts (crash-retry) —
+  **got this right from the start**, unlike `atomize()`'s original
+  guard-clause bug from an earlier session.
+- **Dispatcher wrinkle, resolved**: `compile()` needs an `llm_client` —
+  a real external dependency `accept()`/`atomize()` don't have.
+  `pipeline.py` gained `build_pipeline(llm_client=None)`, which returns
+  the base dispatch table with `compile()` bound in via
+  `functools.partial` for both its statuses. `step_once()`/`advance()`
+  gained an optional `dispatch_table` kwarg — omit it and every existing
+  call site/test is unaffected (base table, `compile()` unregistered).
+  This kept the dispatcher's whole point intact (§4: no interface
+  hardcodes "what runs next") while accommodating real DI instead of a
+  global `LlamaClient`.
+- `cli.py`: `ingest step`/`run` now call a new `_dispatch_table()` that
+  builds a real `LlamaClient` from the vault's config on every
+  invocation (cheap — construction makes no network call) and passes it
+  through `build_pipeline()`. `ingest status` shows `summary`/
+  `entities`/`concepts` once an item reaches `ANALYZED`.
+- **Real behavior change this surfaced, not a bug**: since `compile()`
+  is now unconditionally wired in, `advance()` no longer stops quietly
+  at `PARSED` — it keeps going into `compile()`, and without a reachable
+  `llama-server` that now fails cleanly as `FAILED`/`failed_at_step=
+  ANALYZING` (confirmed via a new test,
+  `test_run_fails_cleanly_with_no_llama_server_reachable` — a real
+  connection error, caught and wrapped, not a crash). Every pre-existing
+  CLI test that assumed "the pipeline stops at PARSED" needed updating —
+  either to expect the clean failure, or (`with_fake_llm_client` fixture,
+  monkeypatches `cli.LlamaClient`) to inject a fake client so the item
+  can reach the new real frontier, `ANALYZED`. The three run-commits-
+  something tests from last session also needed their fake reworked:
+  their old `with_fake_compile_step` monkeypatched the base
+  `_STEP_FOR_STATUS[PARSED]` directly, which `build_pipeline()` now
+  always overwrites when given a non-`None` `llm_client` (which `cli.py`
+  always provides) — replaced with `with_fake_llm_client` (makes real
+  `compile()` succeed) + a new `with_fake_cascade_step` (stands in only
+  for the step that's still actually missing, `ANALYZED`→`COMPLETED`,
+  since `build_pipeline()` never touches that status).
+- Also fixed a sandbox-only test artifact: constructing `openai.OpenAI()`
+  consults proxy env vars, and this sandbox sets a global SOCKS proxy
+  that httpx can't use without the optional `socksio` package — added an
+  autouse fixture clearing those vars for `test_cli_ingest.py` (this has
+  nothing to do with `LlamaClient`'s own correctness, purely a sandbox
+  quirk, same fix already applied narrowly in `test_llm_client.py`).
+- `tests/test_llm_client.py` (11, new), `tests/test_ingest_compile.py`
+  (6, new, hand-written `FakeLlmClient` — proves `compile()`'s own logic
+  independent of any real `LlmClient`), `tests/test_analysis_repo.py`
+  (4, new), `tests/test_chunk_repo.py` (3, new), `tests/
+  test_ingest_pipeline.py` (+4 — `build_pipeline()`/`dispatch_table`),
+  `tests/test_cli_ingest.py` (+2 net after the rework above).
+
 ## Suggested next step
 
-Per `INGEST_PLAN.md` §9, items 1, 2, 3, and 5 are now done. What's left:
+Per `INGEST_PLAN.md` §9, items 1, 2, 3, 4a, and 5 are now done. What's left:
 
-- **Item 4, `ingest` steps 4–5 (`ANALYZING`/`CASCADING`, via `compile()`)**
-  — the only remaining blocker before `run` can drive anything all the
-  way to a real `COMPLETED` and a real commit. Needs the `llm` package
-  first (wrap `llama-server`'s OpenAI-compatible endpoint + `outlines`
-  structured extraction — ARCHITECTURE.md §7), with a mocked LLM client
-  for tests per ARCHITECTURE.md §11. This is the biggest remaining piece
-  of the ingest pipeline and the natural next pickup.
+- **Item 4b, `cascade()`** (`ANALYZED`→`CASCADING`→`CASCADED`→`COMPLETED`)
+  — the last piece before `run`'s commit wiring can fire for real. Needs
+  a new `compiler` package. Merge algorithm already decided
+  (append-only, §10) so that part doesn't need relitigating. This is
+  also where `wiki/` note frontmatter/content shape for entities/
+  concepts gets designed concretely — worth another short design
+  round-trip before coding, same pattern as this session, since it's
+  still a real open question exactly what fields/sections a first-cut
+  entity/concept note has.
 - **Item 6, the watcher** (`stager.watch()`, wired to `auto_watch_raw`)
   — last on purpose, a convenience layer over the already-proven
   `stage()` + `add`/`run` path.
 - `ingest retry`/`ingest watch` remain deferred per the design gaps noted
   in §7.
+- Real end-to-end manual smoke-testing of `compile()` against an actual
+  running `llama-server` still hasn't happened (no server reachable in
+  this sandbox) — worth doing on the user's machine once convenient, to
+  sanity-check the summarize/extract prompts actually produce sensible
+  output against a real local model, not just against mocks.

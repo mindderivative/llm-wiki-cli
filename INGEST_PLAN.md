@@ -309,8 +309,8 @@ doesn't need to mirror the `stager`/`ingest` package split internally):
 |---|---|
 | `ingest add <path...>` | **Built.** Entry point B — stages each path (`stage()` → `verify_and_clean()`, composed for the first time). No run, no commit. |
 | `ingest list [--status STAGED\|FAILED\|...]` | **Built.** List queue items, optionally filtered by status. Primary "what's the state of everything" view after a reboot. |
-| `ingest status <id>` | **Built.** Full detail for one item — status, error, `failed_at_step`, raw_path, archive_path, timestamps. |
-| `ingest step <id>` | **Built.** Run exactly the next pending step for one item. No commit. |
+| `ingest status <id>` | **Built.** Full detail for one item — status, error, `failed_at_step`, raw_path, archive_path, timestamps, plus `summary`/`entities`/`concepts` once `compile()` has produced them (§10). |
+| `ingest step <id>` | **Built.** Run exactly the next pending step for one item — now genuinely includes `compile()` (§10), via a `LlamaClient` built per invocation. No commit. |
 | `ingest step --count N [--status STATUS]` | **Built.** Single-step batch (§4) — advance up to N pool items by one step each, then stop. No commit. |
 | `ingest run --count N\|AUTO` | **Built, including the commit.** Pool-driven, full-completion batch run (§5). `AUTO` drains the whole pool, interruptible via Ctrl-C. Batch-end commit via `vcs.GitEngine` covers exactly the items that reached `COMPLETED`; zero completions → no commit at all. |
 | `ingest run <id...>` | **Built, including the commit.** Explicit-id, full-completion batch run (§5). |
@@ -351,14 +351,14 @@ doesn't need to mirror the `stager`/`ingest` package split internally):
   item (files exist fine, only the hash-check/cleanup failed). These need
   different retry behavior and the row alone doesn't currently distinguish
   them cleanly. Scoped out rather than building a half-correct `retry`.
-- **The pool keeps re-offering items with no next step.** Since `PARSED`
-  is non-terminal, `list_pool()` includes `PARSED` items in every future
-  `run`/`step --count` call until `compile()` exists to move them past
-  it — `run --count AUTO` run twice in a row will re-list and re-attempt
-  every already-`PARSED` item both times (harmlessly — `step_once()`
-  no-ops on them — but it's visible in the output as "no further step
-  implemented yet" rows). Expected given the current build state, not a
-  bug; will stop happening naturally once `compile()` ships.
+- ~~**The pool keeps re-offering items with no next step.**~~ **Partially
+  resolved.** `PARSED` items no longer stall — `compile()` (item 4a,
+  this session) genuinely moves them to `ANALYZED`. The same shape of
+  gap now applies one step further down: `ANALYZED` is non-terminal, so
+  `list_pool()` keeps re-offering `ANALYZED` items until `cascade()`
+  (item 4b) exists to move them past it. Same "harmless, expected,
+  visible as a no-further-step row" behavior, just shifted forward one
+  status.
 - ~~`vcs.GitEngine` doesn't exist~~ **Resolved.** `init()` + `commit()`
   built, wired into `run`'s batch-end commit. **Follow-on gap, left
   open on purpose**: `VaultManager.create()` does not call
@@ -367,14 +367,26 @@ doesn't need to mirror the `stager`/`ingest` package split internally):
   `.git` until something actually completes a full ingest run. Revisit
   if this proves confusing; not addressed now since it's outside item
   5's stated scope ("wired into `run`'s batch-end commit").
-- **`run`'s commit wiring is built and tested, but can't fire for real
-  yet.** Nothing currently reaches `COMPLETED` — the pipeline dispatcher
-  only goes as far as `PARSED` (no `compile()`/cascade, item 4 below).
-  So in practice, every `run` today prints "no items reached COMPLETED"
-  and commits nothing; the wiring itself is verified in
-  `tests/test_cli_ingest.py` by monkeypatching a stand-in for the
-  not-yet-built compile step. This is expected, not a defect — it'll
-  start committing for real the moment item 4 ships.
+- **`run`'s commit wiring is built and tested, but still can't fire for
+  real.** `compile()` (item 4a) is real now, but nothing reaches
+  `COMPLETED` yet — the pipeline goes as far as `ANALYZED` and stops
+  there until `cascade()` (item 4b) exists. So in practice, every `run`
+  today prints "no items reached COMPLETED" and commits nothing; the
+  wiring itself is verified in `tests/test_cli_ingest.py` by
+  monkeypatching a stand-in for the still-not-built `cascade()` step
+  (`with_fake_cascade_step`). Expected, not a defect — will start
+  committing for real the moment item 4b ships.
+- **Real LLM calls need a reachable `llama-server` — there isn't one in
+  this sandbox.** `LlamaClient`'s own tests use a `MagicMock(spec=
+  openai.OpenAI)` (see §10), so they don't need one. But any real
+  `wiki-cli ingest run` invoked in this sandbox will have `compile()`
+  fail with a connection error the moment an item reaches `PARSED` —
+  confirmed this fails *cleanly* (`FAILED`/`failed_at_step=ANALYZING`,
+  not a crash — `tests/test_cli_ingest.py::
+  test_run_fails_cleanly_with_no_llama_server_reachable`), but real
+  end-to-end manual smoke-testing of `compile()` against an actual model
+  still needs to happen on the user's machine, where `llama-server` is
+  actually running.
 
 ## 8. Required changes before implementation starts
 
@@ -443,10 +455,44 @@ doesn't need to mirror the `stager`/`ingest` package split internally):
    named in this build-order item's original text, and `retry` in
    particular has a real design gap around `failed_at_step=STAGED`
    (see §7) worth resolving deliberately rather than rushing.
-4. `ingest` steps 4–5 (`ANALYZING`/`CASCADING`) — depends on `llm`
-   (not started). Mocked LLM client for tests per ARCHITECTURE.md §11.
-   Cascade note writes built atomic (write-temp-then-rename) from the
-   start, per §5's dependency on that.
+4. `ingest` steps 4–5 (`ANALYZING`/`CASCADING`) — split further this
+   session (§10):
+   - ~~**4a, `llm` + `compile()` (`PARSED`→`ANALYZED`)**~~ — **done**.
+     `src/llm_wiki/llm/client.py` (`LlamaClient`, `LlmClient` protocol,
+     `ExtractionResult`) + `src/llm_wiki/ingest/compile.py`. New
+     `queue_analysis` table holds compile()'s output (summary +
+     entities/concepts) until `cascade()` exists to consume it.
+     `pipeline.py` gained `build_pipeline(llm_client)` so `compile()`'s
+     extra dependency doesn't leak into `accept()`/`atomize()`'s
+     signatures — see §10 for the full design. `cli.py`'s `step`/`run`
+     now build a real `LlamaClient` + dispatch table per invocation
+     (`_dispatch_table()`), so `compile()` genuinely runs — no CLI
+     command needed to name it explicitly. `ingest status` shows
+     `summary`/`entities`/`concepts` once an item reaches `ANALYZED`.
+     30 new tests (11 `LlamaClient` — real `outlines` integration
+     against a `MagicMock(spec=openai.OpenAI)` double, 6 `compile()`
+     against a hand-written `LlmClient` fake, 4 `queue_analysis` repo, 3
+     `chunk_repo` read path, 4 dispatcher `build_pipeline()`/
+     `dispatch_table`, 2 new CLI) — 119/119 total.
+     **Real behavior change worth flagging**: since `compile()` is now
+     unconditionally wired into `run`'s dispatch table, `advance()` no
+     longer stops at `PARSED` — it keeps going into `compile()`, and
+     without a reachable `llama-server` that fails cleanly as
+     `FAILED`/`failed_at_step=ANALYZING` rather than stopping quietly.
+     This is correct/expected (no silent stall), but every pre-existing
+     CLI test that used to assert "stops at PARSED" needed updating to
+     either expect that failure (a new test exercises it directly,
+     `test_run_fails_cleanly_with_no_llama_server_reachable`) or inject
+     a fake `LlmClient` (`with_fake_llm_client`, monkeypatches
+     `cli.LlamaClient`) so the item can reach the new real frontier,
+     `ANALYZED`.
+   - **4b, `cascade()` (`ANALYZED`→`COMPLETED`)** — still deliberately
+     deferred to its own session, per §10's reasoning (the riskier,
+     more novel piece: how much an LLM is trusted to touch existing
+     `wiki/` notes). Append-only merge decision already locked in (§10)
+     so it doesn't need relitigating when this starts. Cascade note
+     writes still need to be atomic (write-temp-then-rename) from the
+     start, per §5's dependency on that.
 5. ~~`vcs.GitEngine` minimal commit support, wired into `run`'s
    batch-end commit~~ — **done**, `src/llm_wiki/vcs/engine.py`, 9 tests,
    all passing. `init()` (idempotent — opens or creates the repo +
@@ -467,3 +513,126 @@ doesn't need to mirror the `stager`/`ingest` package split internally):
 6. Watcher (`stager.watch()`), wired to `auto_watch_raw` — last, since
    it's a convenience layer over an already-proven `stage()` +
    `add`/`run` path.
+
+## 10. `compile()` design (step 4) — this session's scope
+
+Item 4 covers two real steps — `compile()` (`PARSED` → `ANALYZING` →
+`ANALYZED`: summarize + extract) and `cascade()` (`ANALYZED` →
+`CASCADING` → `CASCADED` → `COMPLETED`: merge into `wiki/` notes +
+embed). **Decided (user confirmed): this session builds `llm` +
+`compile()` only.** `cascade()` is deliberately deferred to its own
+session — it's the riskier, more novel piece (an algorithm for how much
+an LLM is trusted to touch already-existing, possibly hand-edited
+`wiki/` notes), and slicing it off keeps this increment the same size as
+every other build-order item so far.
+
+**Cascade-merge decision, locked in now even though `cascade()` isn't
+built yet** (so it doesn't need relitigating next session): **append-only**.
+When a source mentions an entity/concept that already has a `wiki/` note,
+the LLM only ever proposes *new* content for the current source — never
+a rewrite of the existing note. The new content is appended under a
+dated subsection (e.g. `### {date} (from {source title})`). Existing
+note text is never sent back through the LLM for rewriting. Chosen over
+"full LLM rewrite" specifically because a rewrite has no way to
+distinguish LLM-generated content from a human's manual edits to the
+same file — anything not fenced off is fair game for the model to
+silently drop or distort. Append-only is safer and fully auditable
+(`git log -p` on a note shows exactly what each cascade run added); the
+tradeoff is notes accumulate as a log rather than staying a continuously
+re-synthesized profile — acceptable for a first version, revisit only if
+it proves to be a real problem in practice.
+
+### `llm` package
+
+`LlamaClient` wraps `llama-server`'s OpenAI-compatible endpoint via the
+`openai` SDK (chat + embeddings) and `outlines` (structured extraction).
+Verified against the actually-installed package versions in this
+sandbox (`openai` 2.48, `outlines` — its 1.x-era API, no `outlines.generate`
+module) rather than assumed from older docs: `outlines.from_openai(client,
+model_name)` wraps any object satisfying `isinstance(client, openai.OpenAI
+| openai.AsyncOpenAI | ...)` — a real type check, not duck typing — and
+the resulting model's `__call__(prompt, output_type=SomePydanticModel)`
+returns a **JSON string** (`response_format={"type": "json_schema", ...}`
+under the hood), not an already-parsed instance; callers must
+`SomeModel.model_validate_json(raw)` themselves.
+
+This matters for testability: since `outlines.from_openai()` does a real
+`isinstance` check, a bare duck-typed fake client doesn't work as a test
+double. `unittest.mock.MagicMock(spec=openai.OpenAI)` does — `spec=`
+makes `isinstance()` pass, and the only surface `outlines`' OpenAI
+backend actually touches is `client.chat.completions.create()` and
+`.choices[i].message.{content,refusal}`, both easy to stub on a spec'd
+mock. Confirmed working end-to-end in the sandbox before writing any
+production code — `LlamaClient`'s tests exercise the **real** `outlines`
+integration (real JSON-schema construction from the Pydantic model, real
+JSON parsing back into it) with zero network access, per ARCHITECTURE.md
+§11's "mocked LLM client" requirement.
+
+`LlmClient` (a `Protocol`, not an ABC) is the narrow interface
+`ingest.compile()` actually depends on — `summarize(text) -> str`,
+`extract(text) -> ExtractionResult`, `embed(texts) -> list[list[float]]`.
+`compile()`'s own tests inject a trivial hand-written fake implementing
+this protocol, never touching `outlines`/`openai` at all — two different
+levels of test double for two different things: `LlamaClient`'s tests
+prove the real `outlines` wiring works; `compile()`'s tests prove the
+step's own logic (state transitions, `queue_analysis` writes, failure
+handling) works, independent of whichever `LlmClient` implementation is
+plugged in.
+
+`ExtractionResult` (`entities: list[str]`, `concepts: list[str]`) is
+deliberately minimal for this first cut — grow it once `cascade()`'s
+real needs (next session) are concrete, not speculatively now.
+
+### New: `queue_analysis` table
+
+`compile()`'s output (summary + extracted entities/concepts) has nowhere
+to live yet — `cascade()`, which will read it and write real `wiki/`
+notes, doesn't exist this session. New table, one row per queue item,
+holds it in the meantime:
+
+```sql
+CREATE TABLE queue_analysis (
+    queue_item_id INTEGER PRIMARY KEY REFERENCES queue (id) ON DELETE CASCADE,
+    summary TEXT NOT NULL,
+    entities TEXT NOT NULL DEFAULT '[]',  -- JSON array
+    concepts TEXT NOT NULL DEFAULT '[]',  -- JSON array
+    created_at TEXT NOT NULL
+);
+```
+
+`INSERT OR REPLACE` on write — a retried `compile()` (found parked at
+`ANALYZING` after a crash) overwrites whatever the previous attempt
+produced, same "redo from scratch, no accumulation of stale partial
+output" convention as everywhere else in the pipeline (§3). `SCHEMA_VERSION`
+bumps 2 → 3.
+
+### `compile()` itself
+
+Reads `chunks` for the item (already atomized — no reason to re-parse
+the raw file), concatenates them with heading markers, sends that to
+`llm_client.summarize()` and `.extract()`, commits a `queue_analysis` row
++ `ANALYZED` status in one transaction. `ANALYZING` is a real, durable
+pre-work-marker commit first (same two-phase pattern as `atomize()`).
+Accepts `PARSED` (normal start) or `ANALYZING` (crash-retry) as valid
+starting statuses — **got this right from the start this time**, unlike
+`atomize()`'s original guard-clause bug (§9 item 2) which only accepted
+one of its two valid start states until it was caught while building the
+dispatcher.
+
+### Dispatcher wrinkle: `compile()` needs a dependency the other steps don't
+
+`accept()`/`atomize()` only need `(item, storage)`. `compile()` also
+needs `llm_client` — an external dependency, not something derivable
+from the row itself. Rather than force every handler to accept-and-ignore
+an unused parameter (churn on already-tested `accept()`/`atomize()` for
+no benefit), `pipeline.py` gains `build_pipeline(llm_client=None)`: a
+factory that returns a dispatch table with `compile()` bound in via
+`functools.partial(compile, llm_client=llm_client)` for both its
+statuses. `step_once()`/`advance()` gain an optional `dispatch_table`
+kwarg; omitting it uses the original module-level table (`STAGED`/
+`QUEUED`/`PARSING` only) unchanged — so every existing call site and test
+keeps working exactly as before, and only callers that actually have an
+`llm_client` available (the CLI) need to know `build_pipeline()` exists.
+This preserves the dispatcher's whole point (§4: no interface hardcodes
+"what runs next") while accommodating real dependency injection instead
+of a global/singleton `LlamaClient`.

@@ -5,7 +5,8 @@ All tables (`queue`, `notes`, `chunks`, `vec_chunks`, `links`,
 fully rebuildable via `StorageEngine.rebuild()`.
 """
 
-from llm_wiki.storage.chunk_repo import insert_chunk_row
+from llm_wiki.storage.analysis_repo import get_analysis_row, upsert_analysis_row
+from llm_wiki.storage.chunk_repo import insert_chunk_row, list_chunks_for_queue_item
 from llm_wiki.storage.engine import DEFAULT_EMBEDDING_DIM, StorageEngine
 from llm_wiki.storage.queue_repo import (
     get_queue_row,
@@ -26,4 +27,7 @@ __all__ = [
     "list_queue_rows",
     "list_pool",
     "insert_chunk_row",
+    "list_chunks_for_queue_item",
+    "upsert_analysis_row",
+    "get_analysis_row",
 ]

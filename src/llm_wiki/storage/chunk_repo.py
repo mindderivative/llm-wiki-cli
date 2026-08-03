@@ -30,3 +30,25 @@ def insert_chunk_row(storage: StorageEngine, chunk: Chunk) -> Chunk:
         ),
     )
     return chunk.model_copy(update={"id": cursor.lastrowid})
+
+
+def list_chunks_for_queue_item(storage: StorageEngine, queue_item_id: int) -> list[Chunk]:
+    """Every chunk belonging to one queue item, in document order
+    (`ordinal` ascending) — what `ingest.compile()` reads as `atomize()`'s
+    committed output (INGEST_PLAN.md §10)."""
+    rows = storage.conn.execute(
+        "SELECT * FROM chunks WHERE queue_item_id = ? ORDER BY ordinal ASC;",
+        (queue_item_id,),
+    ).fetchall()
+    return [
+        Chunk(
+            id=row["id"],
+            note_id=row["note_id"],
+            queue_item_id=row["queue_item_id"],
+            ordinal=row["ordinal"],
+            title=row["title"],
+            content=row["content"],
+            word_count=row["word_count"],
+        )
+        for row in rows
+    ]

@@ -1,13 +1,16 @@
-"""Thin `typer` CLI onto `VaultManager`, `stager`, `ingest`, and `vcs`
-(ARCHITECTURE.md §7, §9; INGEST_PLAN.md §6).
+"""Thin `typer` CLI onto `VaultManager`, `stager`, `ingest`, `llm`, and
+`vcs` (ARCHITECTURE.md §7, §9; INGEST_PLAN.md §6).
 
 `vault` exposes what `VaultManager` does (create/load/validate/
 list-recent/forget). `ingest` composes `stager` + `ingest`'s functions —
 `add` stages, `step`/`run` advance the pipeline (INGEST_PLAN.md §4/§5).
-`run` also does the batch-end commit via `vcs.GitEngine` once at least
-one item reaches `COMPLETED` during the run — see `_ingest_commit_message()`
-below. No `compile`/`lint`/`graph` commands yet; those land once the
-corresponding subpackages exist.
+`step`/`run` build a `LlamaClient` + dispatch table per invocation
+(`_dispatch_table()` below) so `compile()` (INGEST_PLAN.md §10) gets
+driven the same way as every other step, without the CLI hardcoding
+which status needs an LLM. `run` also does the batch-end commit via
+`vcs.GitEngine` once at least one item reaches `COMPLETED` during the
+run — see `_ingest_commit_message()` below. No `lint`/`graph` commands
+yet; those land once the corresponding subpackages exist.
 
 Run via `python -m llm_wiki <command>` (see `__main__.py`). Not wired up
 as a `[project.scripts]` console entry point yet, since the shared
@@ -25,10 +28,11 @@ from rich.console import Console
 from rich.table import Table
 
 from llm_wiki.config import VaultSettings
-from llm_wiki.ingest import advance, step_once
+from llm_wiki.ingest import advance, build_pipeline, step_once
+from llm_wiki.llm import LlamaClient
 from llm_wiki.models import QueueItem, QueueStatus, VaultAlreadyExistsError, VaultNotFoundError
 from llm_wiki.stager import stage, verify_and_clean
-from llm_wiki.storage import StorageEngine, get_queue_row, list_pool, list_queue_rows
+from llm_wiki.storage import StorageEngine, get_analysis_row, get_queue_row, list_pool, list_queue_rows
 from llm_wiki.vault import VaultManager
 from llm_wiki.vcs import GitEngine
 
@@ -149,6 +153,15 @@ def _open_vault(vault_path: Path) -> Iterator[tuple[VaultSettings, StorageEngine
         yield settings, storage
 
 
+def _dispatch_table(settings: VaultSettings):
+    """A fresh `LlamaClient` (from this vault's `llama` config) plus the
+    dispatch table it enables — constructing the client never makes a
+    network call, only actually running `compile()` on an item does, so
+    it's cheap to build unconditionally on every `step`/`run` invocation
+    rather than threading a lazily-constructed one through."""
+    return build_pipeline(LlamaClient(settings.llama))
+
+
 def _parse_status(value: str) -> QueueStatus:
     try:
         return QueueStatus(value.strip().upper())
@@ -216,6 +229,7 @@ def ingest_status(
     """Full detail for one queue item."""
     with _open_vault(vault) as (settings, storage):
         item = get_queue_row(storage, item_id)
+        analysis = get_analysis_row(storage, item_id) if item is not None else None
 
     if item is None:
         err_console.print(f"[red]Error:[/red] no queue item with id {item_id}.")
@@ -231,6 +245,10 @@ def ingest_status(
     table.add_row("failed_at_step", item.failed_at_step.value if item.failed_at_step else "")
     table.add_row("created_at", item.created_at.isoformat())
     table.add_row("updated_at", item.updated_at.isoformat())
+    if analysis is not None:
+        table.add_row("summary", analysis.summary)
+        table.add_row("entities", ", ".join(analysis.entities))
+        table.add_row("concepts", ", ".join(analysis.concepts))
     console.print(table)
 
 
@@ -275,10 +293,11 @@ def ingest_step(
             console.print("Nothing to do.")
             return
 
+        dispatch_table = _dispatch_table(settings)
         table = Table("ID", "Before", "After")
         for pending in items:
             before = pending.status
-            result = step_once(pending, storage)
+            result = step_once(pending, storage, dispatch_table=dispatch_table)
             table.add_row(str(result.id), before.value, result.status.value)
         console.print(table)
 
@@ -350,11 +369,12 @@ def ingest_run(
             console.print("Nothing to do.")
             return
 
+        dispatch_table = _dispatch_table(settings)
         table = Table("ID", "Title", "Result", "Detail")
         try:
             for pending in items:
                 attempted += 1
-                result = advance(pending, storage)
+                result = advance(pending, storage, dispatch_table=dispatch_table)
                 if result.status == QueueStatus.COMPLETED:
                     completed += 1
                     completed_items.append(result)
