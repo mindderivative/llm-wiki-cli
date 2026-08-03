@@ -1,12 +1,32 @@
 from pathlib import Path
 
+import pygit2
 import pytest
 from typer.testing import CliRunner
 
 from llm_wiki.cli import app
+from llm_wiki.ingest import pipeline as ingest_pipeline
+from llm_wiki.models import QueueStatus
+from llm_wiki.storage import update_queue_row
 from llm_wiki.vault import VaultManager
 
 runner = CliRunner()
+
+
+def _fake_complete(item, storage):
+    """Stand-in for the not-yet-built compile()/cascade steps: flips
+    PARSED straight to COMPLETED so run's batch-end commit wiring can be
+    exercised end-to-end before ANALYZING/CASCADING exist (INGEST_PLAN.md
+    §9 build order item 4 is still ahead)."""
+    completed = item.model_copy(update={"status": QueueStatus.COMPLETED})
+    with storage.conn:
+        return update_queue_row(storage, completed)
+
+
+@pytest.fixture
+def with_fake_compile_step(monkeypatch):
+    """Registers `_fake_complete` for PARSED for the duration of one test."""
+    monkeypatch.setitem(ingest_pipeline._STEP_FOR_STATUS, QueueStatus.PARSED, _fake_complete)
 
 
 @pytest.fixture
@@ -158,6 +178,48 @@ def test_run_stops_on_failure(tmp_path: Path, vault_root: Path):
     # third.txt (id 3) must not have been touched -- the run stopped at bad.pdf (id 2).
     status_result = runner.invoke(app, ["ingest", "status", "3", "--vault", str(vault_root)])
     assert "STAGED" in status_result.stdout
+
+
+def test_run_commits_completed_items(tmp_path: Path, vault_root: Path, with_fake_compile_step):
+    _add(vault_root, _write(tmp_path, "note.txt"))
+
+    result = runner.invoke(app, ["ingest", "run", "--count", "AUTO", "--vault", str(vault_root)])
+
+    assert result.exit_code == 0
+    assert "Committed" in result.stdout
+    repo = pygit2.Repository(str(vault_root))
+    commits = list(repo.walk(repo.head.target))
+    assert len(commits) == 1
+    assert commits[0].message == "ingest: note"
+
+
+def test_run_commit_message_lists_multiple_titles(tmp_path: Path, vault_root: Path, with_fake_compile_step):
+    _add(vault_root, _write(tmp_path, "one.txt"))
+    _add(vault_root, _write(tmp_path, "two.txt"))
+
+    result = runner.invoke(app, ["ingest", "run", "--count", "AUTO", "--vault", str(vault_root)])
+
+    assert result.exit_code == 0
+    repo = pygit2.Repository(str(vault_root))
+    commits = list(repo.walk(repo.head.target))
+    assert len(commits) == 1
+    assert commits[0].message == "ingest: 2 files (one, two)"
+
+
+def test_run_commits_only_items_completed_before_failure(
+    tmp_path: Path, vault_root: Path, with_fake_compile_step
+):
+    _add(vault_root, _write(tmp_path, "good.txt"))
+    _add(vault_root, _write(tmp_path, "bad.pdf"))  # unsupported format -> FAILED
+    _add(vault_root, _write(tmp_path, "third.txt"))
+
+    result = runner.invoke(app, ["ingest", "run", "--count", "AUTO", "--vault", str(vault_root)])
+
+    assert result.exit_code == 1
+    repo = pygit2.Repository(str(vault_root))
+    commits = list(repo.walk(repo.head.target))
+    assert len(commits) == 1
+    assert commits[0].message == "ingest: good"  # not "third" -- never attempted
 
 
 def test_run_invalid_count_fails(vault_root: Path):

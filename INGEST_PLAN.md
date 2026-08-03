@@ -312,8 +312,8 @@ doesn't need to mirror the `stager`/`ingest` package split internally):
 | `ingest status <id>` | **Built.** Full detail for one item — status, error, `failed_at_step`, raw_path, archive_path, timestamps. |
 | `ingest step <id>` | **Built.** Run exactly the next pending step for one item. No commit. |
 | `ingest step --count N [--status STATUS]` | **Built.** Single-step batch (§4) — advance up to N pool items by one step each, then stop. No commit. |
-| `ingest run --count N\|AUTO` | **Built**, minus the commit. Pool-driven, full-completion batch run (§5). `AUTO` drains the whole pool, interruptible via Ctrl-C. **No commit performed** — `vcs` doesn't exist yet (§9 build order item 5 is still ahead); the command says so explicitly in its own output. |
-| `ingest run <id...>` | **Built**, same no-commit caveat. Explicit-id, full-completion batch run (§5). |
+| `ingest run --count N\|AUTO` | **Built, including the commit.** Pool-driven, full-completion batch run (§5). `AUTO` drains the whole pool, interruptible via Ctrl-C. Batch-end commit via `vcs.GitEngine` covers exactly the items that reached `COMPLETED`; zero completions → no commit at all. |
+| `ingest run <id...>` | **Built, including the commit.** Explicit-id, full-completion batch run (§5). |
 | `ingest retry <id>` | **Deferred, not built.** Not literally named in §9 build order item 3's text (only "add/list/status/step/run" is) — see the new open item below for why this isn't a trivial add. |
 | `ingest watch` | **Deferred, not built** — §9 build order item 6, needs the actual `watchdog` integration. |
 
@@ -359,6 +359,22 @@ doesn't need to mirror the `stager`/`ingest` package split internally):
   no-ops on them — but it's visible in the output as "no further step
   implemented yet" rows). Expected given the current build state, not a
   bug; will stop happening naturally once `compile()` ships.
+- ~~`vcs.GitEngine` doesn't exist~~ **Resolved.** `init()` + `commit()`
+  built, wired into `run`'s batch-end commit. **Follow-on gap, left
+  open on purpose**: `VaultManager.create()` does not call
+  `GitEngine.init()` — the repo is created lazily on the vault's first
+  real commit, not at `vault create` time. A brand-new vault has no
+  `.git` until something actually completes a full ingest run. Revisit
+  if this proves confusing; not addressed now since it's outside item
+  5's stated scope ("wired into `run`'s batch-end commit").
+- **`run`'s commit wiring is built and tested, but can't fire for real
+  yet.** Nothing currently reaches `COMPLETED` — the pipeline dispatcher
+  only goes as far as `PARSED` (no `compile()`/cascade, item 4 below).
+  So in practice, every `run` today prints "no items reached COMPLETED"
+  and commits nothing; the wiring itself is verified in
+  `tests/test_cli_ingest.py` by monkeypatching a stand-in for the
+  not-yet-built compile step. This is expected, not a defect — it'll
+  start committing for real the moment item 4 ships.
 
 ## 8. Required changes before implementation starts
 
@@ -431,8 +447,23 @@ doesn't need to mirror the `stager`/`ingest` package split internally):
    (not started). Mocked LLM client for tests per ARCHITECTURE.md §11.
    Cascade note writes built atomic (write-temp-then-rename) from the
    start, per §5's dependency on that.
-5. `vcs.GitEngine` minimal commit support, wired into `add`/`run`'s
-   batch-end commit (§5).
+5. ~~`vcs.GitEngine` minimal commit support, wired into `run`'s
+   batch-end commit~~ — **done**, `src/llm_wiki/vcs/engine.py`, 9 tests,
+   all passing. `init()` (idempotent — opens or creates the repo +
+   `.gitignore`) and `commit(message)` (stages `raw/` + `wiki/` as a
+   whole, commits if the tree actually changed, returns the oid or
+   `None`). `push()`/`pull()`/`status()` deliberately not built — out of
+   scope for this item, and push specifically is meant to stay a
+   separate, explicitly user-triggered action once it exists (§5), same
+   pattern as this repo's own local-commit-then-manual-push workflow.
+   `cli.py`'s `ingest run` now collects everything that reaches
+   `COMPLETED` during the run and commits exactly that set afterward,
+   using §5's proposed message format. **Not yet exercisable
+   end-to-end against the real pipeline** — nothing reaches `COMPLETED`
+   until item 4 (below) exists; verified instead via a test-only
+   monkeypatch standing in for `compile()`. See §7 for both follow-on
+   gaps this surfaced (vault creation doesn't `git init` proactively;
+   the commit wiring can't fire for real yet).
 6. Watcher (`stager.watch()`), wired to `auto_watch_raw` — last, since
    it's a convenience layer over an already-proven `stage()` +
    `add`/`run` path.

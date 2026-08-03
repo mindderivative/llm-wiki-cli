@@ -1,12 +1,13 @@
-"""Thin `typer` CLI onto `VaultManager`, `stager`, and `ingest`
+"""Thin `typer` CLI onto `VaultManager`, `stager`, `ingest`, and `vcs`
 (ARCHITECTURE.md §7, §9; INGEST_PLAN.md §6).
 
 `vault` exposes what `VaultManager` does (create/load/validate/
 list-recent/forget). `ingest` composes `stager` + `ingest`'s functions —
 `add` stages, `step`/`run` advance the pipeline (INGEST_PLAN.md §4/§5).
-No `compile`/`lint`/`graph` commands yet; those land once the
-corresponding subpackages exist. **`run` does not commit anything yet**
-— `vcs.GitEngine` isn't built (INGEST_PLAN.md §9, build order item 5).
+`run` also does the batch-end commit via `vcs.GitEngine` once at least
+one item reaches `COMPLETED` during the run — see `_ingest_commit_message()`
+below. No `compile`/`lint`/`graph` commands yet; those land once the
+corresponding subpackages exist.
 
 Run via `python -m llm_wiki <command>` (see `__main__.py`). Not wired up
 as a `[project.scripts]` console entry point yet, since the shared
@@ -25,10 +26,11 @@ from rich.table import Table
 
 from llm_wiki.config import VaultSettings
 from llm_wiki.ingest import advance, step_once
-from llm_wiki.models import QueueStatus, VaultAlreadyExistsError, VaultNotFoundError
+from llm_wiki.models import QueueItem, QueueStatus, VaultAlreadyExistsError, VaultNotFoundError
 from llm_wiki.stager import stage, verify_and_clean
 from llm_wiki.storage import StorageEngine, get_queue_row, list_pool, list_queue_rows
 from llm_wiki.vault import VaultManager
+from llm_wiki.vcs import GitEngine
 
 app = typer.Typer(
     name="llm-wiki",
@@ -247,8 +249,8 @@ def ingest_step(
 ) -> None:
     """Advance one item, or a batch of pool items, by exactly one step each.
 
-    Never commits — that only ever happens at the end of a `run`, once
-    `vcs` exists.
+    Never commits — that only ever happens at the end of a `run`, and
+    only for items that reached COMPLETED (INGEST_PLAN.md §5).
     """
     if (item_id is None) == (count is None):
         err_console.print("[red]Error:[/red] provide exactly one of ITEM_ID or --count.")
@@ -281,6 +283,17 @@ def ingest_step(
         console.print(table)
 
 
+def _ingest_commit_message(items: list[QueueItem]) -> str:
+    """`"ingest: <title>"` for one item, `"ingest: N files (title1, ...)"`
+    for several — INGEST_PLAN.md §5's proposed format, applied to exactly
+    the items that reached `COMPLETED` in this run (not everything
+    attempted)."""
+    if len(items) == 1:
+        return f"ingest: {items[0].title}"
+    titles = ", ".join(item.title for item in items)
+    return f"ingest: {len(items)} files ({titles})"
+
+
 @ingest_app.command("run")
 def ingest_run(
     item_ids: list[int] | None = typer.Argument(
@@ -295,8 +308,10 @@ def ingest_run(
 
     A FAILED item stops the run at whatever count it reached. `--count
     AUTO` is interruptible (Ctrl-C) — stops cleanly between items rather
-    than mid-step. **No commit is performed yet** — `vcs.GitEngine` isn't
-    built (INGEST_PLAN.md §9).
+    than mid-step. Once the run stops (by count, by FAILED, or by
+    interrupt), everything that reached COMPLETED is committed in a
+    single batch-end commit via `vcs.GitEngine` (INGEST_PLAN.md §5) — a
+    run that completes zero items commits nothing.
     """
     ids_given = bool(item_ids)
     if ids_given == (count is not None):
@@ -314,6 +329,7 @@ def ingest_run(
             raise typer.Exit(code=1) from None
 
     completed = 0
+    completed_items: list[QueueItem] = []
     attempted = 0
     failed_item = None
     interrupted = False
@@ -341,6 +357,7 @@ def ingest_run(
                 result = advance(pending, storage)
                 if result.status == QueueStatus.COMPLETED:
                     completed += 1
+                    completed_items.append(result)
                     table.add_row(str(result.id), result.title, "[green]COMPLETED[/green]", "")
                 elif result.status == QueueStatus.FAILED:
                     table.add_row(str(result.id), result.title, "[red]FAILED[/red]", result.error or "")
@@ -364,7 +381,15 @@ def ingest_run(
         step_name = failed_item.failed_at_step.value if failed_item.failed_at_step else "?"
         err_console.print(f"[red]Stopped:[/red] item {failed_item.id} failed at {step_name}.")
 
-    console.print("[dim]No commit performed — vcs.GitEngine isn't built yet (INGEST_PLAN.md §9).[/dim]")
+    if completed_items:
+        message = _ingest_commit_message(completed_items)
+        oid = GitEngine(settings.vault_root).commit(message)
+        if oid is not None:
+            console.print(f"[green]Committed[/green] {len(completed_items)} item(s) -> {oid[:10]} ({message!r})")
+        else:
+            console.print("[dim]Nothing to commit — completed item(s) produced no file changes.[/dim]")
+    else:
+        console.print("[dim]No commit performed — no items reached COMPLETED this run.[/dim]")
 
     if failed_item is not None:
         raise typer.Exit(code=1)
