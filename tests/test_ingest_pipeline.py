@@ -4,7 +4,7 @@ import pytest
 
 from llm_wiki.ingest import advance, build_pipeline, step_once
 from llm_wiki.llm.client import ExtractionResult
-from llm_wiki.models import Chunk, QueueItem, QueueStatus
+from llm_wiki.models import Chunk, Mention, QueueItem, QueueStatus
 from llm_wiki.storage import StorageEngine, insert_chunk_row, insert_queue_row
 from llm_wiki.vault import VaultManager
 
@@ -19,7 +19,7 @@ class FakeLlmClient:
         return "a summary"
 
     def extract(self, text: str) -> ExtractionResult:
-        return ExtractionResult(entities=["Acme Corp"], concepts=[])
+        return ExtractionResult(entities=[Mention(name="Acme Corp", note="n")], concepts=[])
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         raise NotImplementedError

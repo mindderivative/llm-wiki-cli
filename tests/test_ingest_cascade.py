@@ -3,8 +3,15 @@ from pathlib import Path
 import pytest
 
 from llm_wiki.ingest.cascade import cascade
-from llm_wiki.models import Analysis, CompilationError, QueueItem, QueueStatus
-from llm_wiki.storage import StorageEngine, get_queue_row, insert_queue_row, upsert_analysis_row
+from llm_wiki.models import Analysis, CompilationError, Mention, QueueItem, QueueStatus
+from llm_wiki.storage import (
+    StorageEngine,
+    get_note_row_by_slug,
+    get_queue_row,
+    insert_queue_row,
+    update_queue_row,
+    upsert_analysis_row,
+)
 
 
 class FakeLlmClient:
@@ -44,6 +51,8 @@ def _item_with_analysis(
     status: QueueStatus = QueueStatus.ANALYZED,
     title: str = "note",
     with_analysis: bool = True,
+    entities: list[Mention] | None = None,
+    concepts: list[Mention] | None = None,
 ) -> QueueItem:
     archive_path = vault_root / "raw" / ".sources" / f"{title}.txt"
     archive_path.write_text("hello")
@@ -52,7 +61,13 @@ def _item_with_analysis(
         item = insert_queue_row(storage, item)
         if with_analysis:
             upsert_analysis_row(
-                storage, Analysis(queue_item_id=item.id, summary="a summary", entities=[], concepts=[])
+                storage,
+                Analysis(
+                    queue_item_id=item.id,
+                    summary="a summary",
+                    entities=entities or [],
+                    concepts=concepts or [],
+                ),
             )
     return item
 
@@ -125,3 +140,44 @@ def test_cascade_does_not_leave_orphan_note_row_on_embed_failure(vault_root: Pat
 
     count = storage.conn.execute("SELECT COUNT(*) AS n FROM notes;").fetchone()["n"]
     assert count == 0
+
+
+def test_cascade_fans_out_to_entity_and_concept_notes(vault_root: Path, storage: StorageEngine):
+    item = _item_with_analysis(
+        vault_root,
+        storage,
+        title="quarterly-report",
+        entities=[Mention(name="Acme Corp", note="Central vendor this quarter.")],
+        concepts=[Mention(name="earnings", note="Main topic of the report.")],
+    )
+
+    cascade(item, storage, FakeLlmClient(), vault_root)
+
+    entity_note = get_note_row_by_slug(storage, "acme-corp")
+    concept_note = get_note_row_by_slug(storage, "earnings")
+    assert entity_note is not None
+    assert entity_note.path.is_file()
+    assert "Central vendor this quarter." in entity_note.path.read_text()
+    assert concept_note is not None
+    assert concept_note.path.is_file()
+
+
+def test_cascade_retry_does_not_duplicate_entity_mentions(vault_root: Path, storage: StorageEngine):
+    item = _item_with_analysis(
+        vault_root,
+        storage,
+        title="quarterly-report",
+        entities=[Mention(name="Acme Corp", note="Central vendor this quarter.")],
+    )
+    cascade(item, storage, FakeLlmClient(), vault_root)
+
+    # Simulate a crash-retry: item found parked at CASCADING a second time.
+    retried = get_queue_row(storage, item.id).model_copy(update={"status": QueueStatus.CASCADING})
+    with storage.conn:
+        update_queue_row(storage, retried)
+    cascade(retried, storage, FakeLlmClient(), vault_root)
+
+    entity_note = get_note_row_by_slug(storage, "acme-corp")
+    assert entity_note.sources == ["quarterly-report"]
+    bullet_lines = [line for line in entity_note.path.read_text().splitlines() if line.startswith("- 20")]
+    assert len(bullet_lines) == 1

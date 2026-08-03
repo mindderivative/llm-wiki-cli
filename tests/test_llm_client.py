@@ -7,7 +7,7 @@ import pytest
 
 from llm_wiki.config import LlamaServerConfig
 from llm_wiki.llm.client import ExtractionResult, LlamaClient
-from llm_wiki.models import CompilationError
+from llm_wiki.models import CompilationError, Mention
 
 
 @pytest.fixture
@@ -68,13 +68,21 @@ def test_summarize_wraps_openai_errors(config, fake_openai):
 
 
 def test_extract_returns_structured_result(config, fake_openai):
-    payload = json.dumps({"entities": ["Acme Corp"], "concepts": ["supply chain"]})
+    payload = json.dumps(
+        {
+            "entities": [{"name": "Acme Corp", "note": "Manages its supply chain carefully."}],
+            "concepts": [{"name": "supply chain", "note": "Central topic of the text."}],
+        }
+    )
     fake_openai.chat.completions.create.return_value = _chat_response(payload)
     client = LlamaClient(config, openai_client=fake_openai)
 
     result = client.extract("Acme Corp manages its supply chain carefully.")
 
-    assert result == ExtractionResult(entities=["Acme Corp"], concepts=["supply chain"])
+    assert result == ExtractionResult(
+        entities=[Mention(name="Acme Corp", note="Manages its supply chain carefully.")],
+        concepts=[Mention(name="supply chain", note="Central topic of the text.")],
+    )
 
 
 def test_extract_requests_json_schema_for_extraction_result(config, fake_openai):

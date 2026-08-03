@@ -35,7 +35,7 @@ from outlines.exceptions import OutlinesError
 from pydantic import BaseModel, Field
 
 from llm_wiki.config import LlamaServerConfig
-from llm_wiki.models import CompilationError
+from llm_wiki.models import CompilationError, Mention
 
 _SUMMARIZE_SYSTEM_PROMPT = (
     "You are a precise summarizer for a personal knowledge wiki. Summarize "
@@ -49,17 +49,22 @@ _EXTRACT_INSTRUCTIONS = (
     "other specific named things) and every general concept (ideas, "
     "principles, methods) explicitly discussed in the text below. Only "
     "include items that are actually present in the text — do not invent "
-    "or infer anything not mentioned.\n\n"
+    "or infer anything not mentioned. For each one, also write a single "
+    "concise sentence capturing what this specific text says about it — "
+    "only what's actually stated here, not general background "
+    "knowledge.\n\n"
 )
 
 
 class ExtractionResult(BaseModel):
-    """Structured output of `LlamaClient.extract()`. Deliberately minimal
-    for this first cut (INGEST_PLAN.md §10) — grow it once `cascade()`'s
-    real needs are concrete, not speculatively now."""
+    """Structured output of `LlamaClient.extract()`. `entities`/`concepts`
+    are `Mention`s (name + a one-sentence note of what this text says
+    about it) — richer than a bare name list so a first-mention entity/
+    concept note actually has content, without needing a second LLM call
+    per entity (INGEST_PLAN.md §12)."""
 
-    entities: list[str] = Field(default_factory=list)
-    concepts: list[str] = Field(default_factory=list)
+    entities: list[Mention] = Field(default_factory=list)
+    concepts: list[Mention] = Field(default_factory=list)
 
 
 class LlmClient(Protocol):

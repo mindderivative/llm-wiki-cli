@@ -46,6 +46,34 @@ def get_note_row_by_slug(storage: StorageEngine, slug: str) -> Note | None:
     return _row_to_note(row) if row is not None else None
 
 
+def update_note_row(storage: StorageEngine, note: Note) -> Note:
+    """Update an existing `notes` row in place, by `id`.
+
+    Only `tags`/`sources`/`content_hash`/`updated_at` are expected to
+    change post-creation — `path`/`slug`/`type`/`title` are set once at
+    creation and never rewritten here. Used by
+    `compiler.fan_out_mentions()`'s repeat-mention append path
+    (INGEST_PLAN.md §12); the caller is responsible for having already
+    merged the new `sources` entry and recomputed `content_hash` before
+    calling this.
+    """
+    storage.conn.execute(
+        """
+        UPDATE notes
+        SET tags = ?, sources = ?, content_hash = ?, updated_at = ?
+        WHERE id = ?;
+        """,
+        (
+            json.dumps(note.tags),
+            json.dumps(note.sources),
+            note.content_hash,
+            note.updated_at.isoformat(),
+            note.id,
+        ),
+    )
+    return note
+
+
 def _row_to_note(row) -> Note:
     return Note(
         id=row["id"],

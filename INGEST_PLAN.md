@@ -355,11 +355,9 @@ doesn't need to mirror the `stager`/`ingest` package split internally):
   them cleanly. Scoped out rather than building a half-correct `retry`.
 - ~~**The pool keeps re-offering items with no next step.**~~ **Resolved.**
   `compile()` (item 4a) moves `PARSED` → `ANALYZED`; `cascade()` (item
-  4b, source notes only) moves `ANALYZED` all the way to `COMPLETED` —
-  genuinely terminal, so the pool no longer re-offers a completed item.
-  Entity/concept note fan-out isn't built yet, but that doesn't reopen
-  this gap: it's LLM-driven post-processing on an already-`COMPLETED`
-  item, not a queue status of its own.
+  4b) moves `ANALYZED` all the way to `COMPLETED`, including the
+  entity/concept fan-out (§12) — genuinely terminal, so the pool no
+  longer re-offers a completed item.
 - ~~`vcs.GitEngine` doesn't exist~~ **Resolved.** `init()` + `commit()`
   built, wired into `run`'s batch-end commit. **Follow-on gap, left
   open on purpose**: `VaultManager.create()` does not call
@@ -484,27 +482,32 @@ doesn't need to mirror the `stager`/`ingest` package split internally):
      a fake `LlmClient` (`with_fake_llm_client`, monkeypatches
      `cli.LlamaClient`) so the item can reach the new real frontier,
      `ANALYZED`.
-   - ~~**4b, `cascade()` (`ANALYZED`→`COMPLETED`)**~~ — **done, source
-     notes only** (§11). New `compiler` package (`write_source_note()`)
-     + `storage/notes_repo.py` + `chunk_repo.insert_embedding()`.
-     `cascade()` writes one `wiki/sources/{slug}.md` note per compiled
-     item (frontmatter + summary + source pointer), embeds it, and goes
+   - ~~**4b, `cascade()` (`ANALYZED`→`COMPLETED`)**~~ — **done, both
+     halves** (§11 source notes, §12 entity/concept fan-out). New
+     `compiler` package (`write_source_note()` + `fan_out_mentions()`)
+     + `storage/notes_repo.py` (+ `update_note_row()`) +
+     `chunk_repo.insert_embedding()`. `cascade()` writes one
+     `wiki/sources/{slug}.md` note per compiled item, then fans out to
+     create-or-update a `wiki/entities/`/`wiki/concepts/{slug}.md` note
+     for everything `compile()` extracted — append-only, one dated
+     "Mentioned in" bullet per source, idempotent on retry — then goes
      straight to `COMPLETED` (no separate durable `CASCADED` resting
-     state — see §11's reasoning). Entity/concept note fan-out — the
-     actual "cascade" half, append-only merge per §10 — is **not**
-     built yet; deferred to its own session, same incremental slicing as
-     splitting `compile()`/`cascade()` apart in the first place.
-     `build_pipeline()` now also takes `vault_root` and only binds
-     `cascade()` in when both `llm_client` and `vault_root` are given.
-     `cli.py`'s `_dispatch_table()` passes both unconditionally — a
-     `LlamaClient` construction is cheap (no network call), so `run`/
-     `step` now genuinely drive items all the way to `COMPLETED` and
-     `run`'s batch-end `vcs` commit (item 5) is exercisable end-to-end
-     for the first time. 26 new tests (5 `textutil.slugify()`, 3
-     `notes_repo`, 2 `chunk_repo.insert_embedding()`, 6
-     `compiler.write_source_note()`, 7 `cascade()`, plus CLI test
-     updates for the new real `COMPLETED`/`Committed` frontier) —
-     142/142 total.
+     state — see §11's reasoning). `ExtractionResult`/`Analysis` gained
+     `Mention` (`name` + a one-sentence `note`) in place of bare name
+     strings, still via `compile()`'s single existing `extract()` call —
+     no new LLM call — so entity/concept notes actually carry content
+     instead of empty bookkeeping stubs (§12, a mid-session correction
+     after the original "minimal stub" framing turned out to mean
+     "empty" in practice). `build_pipeline()` also takes `vault_root`
+     and only binds `cascade()` in when both `llm_client` and
+     `vault_root` are given. `cli.py`'s `_dispatch_table()` passes both
+     unconditionally — a `LlamaClient` construction is cheap (no network
+     call), so `run`/`step` now genuinely drive items all the way to
+     `COMPLETED` and `run`'s batch-end `vcs` commit (item 5) is
+     exercisable end-to-end. 153/153 total (was 142; +11: 2
+     `notes_repo.update_note_row()`, 7 `fan_out_mentions()`, 2
+     `cascade()` fan-out wiring, plus `Mention`-shape updates across
+     existing `analysis_repo`/`llm_client`/`compile()`/pipeline tests).
 5. ~~`vcs.GitEngine` minimal commit support, wired into `run`'s
    batch-end commit~~ — **done**, `src/llm_wiki/vcs/engine.py`, 9 tests,
    all passing. `init()` (idempotent — opens or creates the repo +
@@ -772,3 +775,140 @@ the equivalent problem on the staging side (§2.1); building the
 equivalent for `cascade()` felt like scope creep for a first cut and
 is called out here explicitly rather than silently ignored — revisit if
 it proves to matter in practice.
+
+## 12. Entity/concept note fan-out (the actual "cascade") — this session
+
+§11 built (a), the source note. This section is (b): for every entity/
+concept `compile()` extracted, create-or-update a `wiki/entities/{slug}.md`
+or `wiki/concepts/{slug}.md` note. Three questions asked before coding
+(the first two were asked before writing any code; the third came up
+mid-implementation once the first draft of this section made clear what
+"minimal stub" actually meant in practice):
+
+1. **Should `write_source_note()`'s body link out to the entities/
+   concepts it mentions this session (a `## Mentions` section)?**
+   **Decided: no** — entity/concept side only. `write_source_note()`
+   stays exactly as §11 left it. Entity/concept notes still track which
+   sources mention them (their own "Mentioned in" list + the `notes.sources`
+   DB column), just not reflected back into the source note's body.
+   Smaller diff, keeps this session scoped to the new fan-out logic.
+   Bidirectional linking is a natural follow-up once `graph`/`lint`
+   actually consume `[[wikilinks]]` — not before.
+2. **Should an entity/concept note's embedding refresh every time a new
+   source mentions it?** **Decided: no** — embed once at creation, leave
+   it alone on every later append. No chunk-update code path needed. A
+   known v1 limitation, same "revisit if it proves to matter" pattern as
+   the file/DB atomicity gap in §11.
+3. **Does a "minimal stub" mean the note carries zero actual information
+   — just a title and a list of which sources mention it?** As drafted
+   from §11's original wording, yes — `ExtractionResult` only ever held
+   bare name strings, so there was nothing to put in the note besides
+   bookkeeping. **Flagged as a real problem, not accepted**: an entity
+   page with no content about the entity isn't useful. **Decided: richer
+   extraction, not richer stubs.** `compile()` still makes exactly one
+   `extract()` call — no new LLM call — but `ExtractionResult` now asks
+   for a short note alongside each name (see below), so a "minimal stub"
+   still means *minimal effort this session* (no synthesis, no
+   re-reading old note content, no rewriting), not *empty of content*.
+
+### Schema change: `ExtractionResult`/`Analysis` gain a `Mention` shape
+
+`entities: list[str]` / `concepts: list[str]` become `entities:
+list[Mention]` / `concepts: list[Mention]`, where `Mention = {name: str,
+note: str}` (new `models.Mention`, imported by `llm.client.ExtractionResult`
+too — one shape, not two). `_EXTRACT_INSTRUCTIONS` updated to ask for
+"a one-sentence note capturing what this specific text says about it"
+per entity/concept, still explicitly scoped to only what's in the text
+(no invention), matching the existing extraction prompt's discipline.
+
+`queue_analysis.entities`/`.concepts` are still just `TEXT` columns
+holding a JSON blob (§10) — the *shape* of that JSON changes, but no DDL
+column changes, so no `SCHEMA_VERSION` bump. Old rows wouldn't parse
+under the new shape, but `queue_analysis` is derived/rebuildable cache
+data (ARCHITECTURE.md §2.1) with no real installations yet — not a
+migration concern.
+
+### Matching an extracted name to an existing note
+
+`Mention.name` is a bare string — no canonical ID. `slugify(name)`
+(already lowercases) is the match key, same as source titles. Two
+sources saying "Acme Corp" and "acme corp" collapse to the same note
+automatically (slugify normalizes case); two sources saying "Acme" vs.
+"Acme Corporation" do **not** — that's real entity resolution,
+explicitly out of scope for v1, same category of deferred problem as
+fuzzy title matching. Not solved here, not silently ignored: called out
+so it isn't mistaken for a bug later.
+
+`notes.slug` is globally unique across every note type (source, entity,
+concept, synthesis) — so a slug collision *across* types (an extracted
+entity name happens to slugify to the same thing as an existing source or
+concept note) is possible, if rare. Handled by reusing §11's existing
+`-2`/`-3`... suffixing helper rather than inventing a second mechanism:
+look up by slug first; if a note exists **and its type matches** what
+we're about to create, that's the real match (append to it); if a note
+exists with a **different type**, treat it as a genuine collision and
+suffix a new slug for the new note, exactly like two same-titled sources
+already do in §11.
+
+### New note (first mention)
+
+```
+---
+type: entity        # or concept
+title: Acme Corp
+tags: []
+sources:
+- quarterly-report
+---
+# Acme Corp
+
+## Mentioned in
+
+- 2026-08-02: [[quarterly-report]] (quarterly-report) — Vendor supplying
+  Q3's primary compute contract; renewal due Nov.
+```
+
+One line per mention: date, a `[[wikilink]]` to the source note's slug
+(consistent with ARCHITECTURE.md §6's stated `[[wikilink]]` convention
+for the not-yet-built `links` table, even though nothing parses it yet),
+the source title for human readability, then the extracted `Mention.note`
+itself. Single-line-per-mention (not a nested sub-paragraph) specifically
+so appending stays trivial string concatenation, not markdown-aware
+editing — see below. Written via the same write-temp-then-rename +
+`notes`/`chunks`/`vec_chunks` insert sequence as `write_source_note()`
+(§11) — one chunk, `content` = the `Mention.note` text (not just the bare
+name, now that there's real content), embedded via `llm_client.embed()`.
+
+### Repeat mention (note already exists)
+
+Read the existing file (`python-frontmatter`), append one bullet line
+under `## Mentioned in`, rewrite atomically. Append is **safe to reason
+about as literal string appending, not real markdown parsing**, because
+a v1 entity/concept note's body only ever *has* one section — nothing
+follows `## Mentioned in`, ever, so "add a new line at the end" is
+equivalent to "add a new line to the list." Updates `notes.sources` (append
+`item.title` if not already present) and `content_hash` via a new
+`notes_repo.update_note_row()`; does **not** touch `chunks`/`vec_chunks`
+(decision 2 above) — so the note's embedding still only reflects its
+*first* mention's `Mention.note`, even though the file itself accumulates
+every mention's note text. Worth remembering if #2 above ever gets
+revisited.
+
+**Idempotent by construction, for crash-retry safety**: if `item.title`
+is already in the note's `sources` list, the append is skipped — a
+`cascade()` retry (found parked at `CASCADING`) that gets this far a
+second time doesn't duplicate the bullet. This is the one place this
+session adds real retry-idempotency beyond what §11's slug-collision
+check already gave `write_source_note()`.
+
+### `compiler.fan_out_mentions()`
+
+`fan_out_mentions(item, analysis, source_note, vault_root, storage,
+llm_client) -> list[Note]` — new function alongside `write_source_note()`
+in `compiler/notes.py`. `ingest.cascade()` calls both, in the same
+`with storage.conn:` transaction as the terminal `COMPLETED` write (same
+"whole thing commits together or none of it does" shape §11 already
+established). Dedupes `entities`/`concepts` by slug within one item
+(preserving first-seen `Mention`, in case the LLM emits the same name
+twice with different note text) before fan-out, so a name mentioned
+twice in one extraction doesn't double-append.

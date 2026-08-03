@@ -57,28 +57,30 @@ before any interface (CLI/MCP/GUI). No cloud LLM SDKs — local
 
 ## What's built so far
 
-All under `src/llm_wiki/`, with tests in `tests/`. **142/142 tests passing**
+All under `src/llm_wiki/`, with tests in `tests/`. **153/153 tests passing**
 against the real `~/pyDev/venv` interpreter as of this session.
 
 | Module | File(s) | Status |
 |---|---|---|
 | Package scaffold | `pyproject.toml`, `src/llm_wiki/{vault,stager,ingest,llm,compiler,graph,lint,vcs,storage}/__init__.py` | Done — subpackages beyond `storage`/`vault`/`stager`/`ingest`/`vcs`/`llm`/`compiler` are docstring-only stubs, not implemented |
 | `config` | `config.py` | Done — `LlamaServerConfig`, `VaultSettings` (load/save `.llm-wiki-config`, derived path properties) |
-| `models` | `models.py` | Done — `QueueItem` (10-value `QueueStatus`, `failed_at_step`, defaults to `STAGED`), `Note`, `Chunk`, `Analysis`, `Link`, `LintFinding`; typed exception hierarchy (`VaultNotFoundError`, `StorageError`, `IngestionError`, `CompilationError`, `GitError`, etc.); public `utcnow()` helper |
-| `textutil` | `textutil.py` (**new this session**) | `slugify(text)` — shared out of `stager`'s old private copy, now also used by `compiler.write_source_note()` |
-| `storage` | `storage/{schema,engine,queue_repo,chunk_repo,analysis_repo,notes_repo}.py` | Done — `StorageEngine`: connect/init_schema/rebuild/close, best-effort `sqlite-vec` loading, FK + CHECK constraints verified against real SQLite. Schema version 3. `queue_repo`/`chunk_repo`/`analysis_repo`/`notes_repo` (**new this session**): shared row (de)serialization, no internal `.commit()` (callers wrap writes in `with storage.conn:`). `chunk_repo` gained `insert_embedding()` (**new** — writes into `vec_chunks` via `sqlite_vec.serialize_float32()`, no-ops if `vec_available` is false) |
-| `vault` | `vault/manager.py` | Done — `VaultManager`: create/load/validate vault trees, seeds `wiki/index.md`/`log.md`/`SCHEMA.md`, wires in `StorageEngine` on create, cross-vault recent-vaults list (path injectable for tests). **Does not `git init` the vault** — lazy, on first real commit |
+| `models` | `models.py` | Done — `QueueItem` (10-value `QueueStatus`, `failed_at_step`, defaults to `STAGED`), `Note`, `Chunk`, `Analysis`, `Mention` (**new this session** — `name` + a one-sentence `note`, replaces bare entity/concept name strings), `Link`, `LintFinding`; typed exception hierarchy; public `utcnow()` helper |
+| `textutil` | `textutil.py` | `slugify(text)` — shared, used by both `stager` and `compiler` |
+| `storage` | `storage/{schema,engine,queue_repo,chunk_repo,analysis_repo,notes_repo}.py` | Done — `StorageEngine`: connect/init_schema/rebuild/close, best-effort `sqlite-vec` loading, FK + CHECK constraints verified against real SQLite. Schema version 3. `queue_repo`/`chunk_repo`/`analysis_repo`/`notes_repo`: shared row (de)serialization, no internal `.commit()`. `notes_repo` gained `update_note_row()` (**new this session** — in-place `tags`/`sources`/`content_hash`/`updated_at` update, used by the entity/concept append path) |
+| `vault` | `vault/manager.py` | Done — `VaultManager`: create/load/validate vault trees, seeds `wiki/index.md`/`log.md`/`SCHEMA.md`, wires in `StorageEngine` on create, cross-vault recent-vaults list. **Does not `git init` the vault** — lazy, on first real commit |
 | `stager` | `stager/{stager,cleanup}.py` | Done — `stage()`/`verify_and_clean()`, composed by `wiki-cli ingest add`. Step 1 of the pipeline only. 10 tests |
-| `llm` | `llm/client.py` | `LlamaClient`: wraps `llama-server`'s OpenAI-compatible endpoint via `openai` (chat + embeddings) and `outlines` (grammar-constrained structured extraction). `LlmClient` — a narrow `Protocol`, not an ABC. `summarize()`, `extract() -> ExtractionResult`, `embed()` (now actually consumed, by `compiler.write_source_note()`). 11 tests, including real `outlines` integration exercised via `MagicMock(spec=openai.OpenAI)` (a bare duck-typed fake fails `outlines.from_openai()`'s real `isinstance` check) |
-| `compiler` | `compiler/notes.py` (**new this session**) | `write_source_note(item, analysis, vault_root, storage, llm_client) -> Note` — builds `wiki/sources/{slug}.md` (frontmatter + summary + source pointer) via `python-frontmatter`, write-temp-then-rename, inserts `notes`+`chunks`+embeds via `insert_embedding()`. Slug collisions (DB + filesystem) resolved with a `-2`/`-3`... suffix, same pattern `stager.stage()` uses. Deliberately excludes entities/concepts from note content — no linking format invented yet. 6 tests |
-| `ingest` | `ingest/{accept,atomize,compile,cascade,pipeline}.py` | `accept()` (step 2), `atomize()` (step 3). `compile()` (step 4, `PARSED`→`ANALYZING`→`ANALYZED`: summarize+extract via `LlmClient`, commits a `queue_analysis` row). `cascade()` (step 5, **new this session** — `ANALYZED`→`CASCADING`→`COMPLETED`: reads the `queue_analysis` row, calls `compiler.write_source_note()`, goes straight to `COMPLETED` with no separate durable `CASCADED` resting state — see `INGEST_PLAN.md` §11. Entity/concept note fan-out — the actual "cascade" half — is **not** built yet, deferred to its own session). `pipeline.py`: `step_once()`/`advance()` dispatcher + `build_pipeline(llm_client, vault_root)` (**vault_root new this session** — `cascade()` only gets bound in when both dependencies are present). 37 tests (12 accept/atomize + 6 `compile()` + 7 `cascade()` + 12 dispatcher) |
-| `vcs` | `vcs/engine.py` | `GitEngine`: `init()` (idempotent) + `commit(message)` (stages `raw/`+`wiki/`, no-ops if nothing changed). `push()`/`pull()`/`status()` deliberately not built. **Now exercisable end-to-end for real** — items genuinely reach `COMPLETED` since `cascade()` exists. 9 tests |
-| CLI | `cli.py`, `__main__.py` | `vault` group (smoke-tested only). `ingest` group: `add`, `list`, `status` (shows `summary`/`entities`/`concepts` once `ANALYZED`), `step`, `run` — `step`/`run` build a real `LlamaClient` + full dispatch table (`compile()` + `cascade()`) per invocation (`_dispatch_table()`), so items now genuinely drive all the way to `COMPLETED` and `run`'s batch-end commit fires for real. `retry`/`watch` still deliberately not built. 19 CLI tests via `typer.testing.CliRunner` |
+| `llm` | `llm/client.py` | `LlamaClient`: wraps `llama-server`'s OpenAI-compatible endpoint via `openai` (chat + embeddings) and `outlines` (grammar-constrained structured extraction). `ExtractionResult.entities`/`.concepts` are now `list[Mention]` (**changed this session** — a name plus a one-sentence note of what the text says about it, not a bare string), same single `extract()` call as before, no new LLM call. 11 tests |
+| `compiler` | `compiler/notes.py` | `write_source_note(item, analysis, vault_root, storage, llm_client) -> Note` — builds `wiki/sources/{slug}.md`, one chunk (the summary), embedded. `fan_out_mentions(item, analysis, source_note, vault_root, storage, llm_client) -> list[Note]` (**new this session** — the actual "cascade") — for every extracted entity/concept, creates a `wiki/entities/`/`wiki/concepts/{slug}.md` stub (frontmatter + a "Mentioned in" bullet carrying the `Mention.note` text, embedded once) or appends a new dated bullet to an already-existing one (append-only, idempotent per source, no re-embed on append). Slug matching by `slugify(name)`, cross-type collisions suffixed same as same-titled sources. 19 tests (6 `write_source_note()` + 13 `fan_out_mentions()`) |
+| `ingest` | `ingest/{accept,atomize,compile,cascade,pipeline}.py` | `accept()` (step 2), `atomize()` (step 3), `compile()` (step 4). `cascade()` (step 5, `ANALYZED`→`CASCADING`→`COMPLETED`) **now calls both halves** — `write_source_note()` then `fan_out_mentions()`, same transaction as the terminal `COMPLETED` write, straight to `COMPLETED` with no separate durable `CASCADED` state. `pipeline.py`: `step_once()`/`advance()` dispatcher + `build_pipeline(llm_client, vault_root)`. 39 tests (12 accept/atomize + 6 `compile()` + 9 `cascade()` + 12 dispatcher) |
+| `vcs` | `vcs/engine.py` | `GitEngine`: `init()` (idempotent) + `commit(message)`. `push()`/`pull()`/`status()` deliberately not built. Exercisable end-to-end for real. 9 tests |
+| CLI | `cli.py`, `__main__.py` | `vault` group (smoke-tested only). `ingest` group: `add`, `list`, `status`, `step`, `run` — genuinely drive items all the way to `COMPLETED`, including the entity/concept fan-out. `retry`/`watch` still deliberately not built. 19 CLI tests via `typer.testing.CliRunner` |
 
-Not started: entity/concept note fan-out (the append-only "cascade"
-half of item 4b — decided, not yet built, see `INGEST_PLAN.md` §11),
-`graph`, `lint`, `vcs.push()`/`pull()`/`status()`, `ingest retry`/`watch`,
-watcher (`stager.watch()`).
+Not started: `graph`, `lint`, `vcs.push()`/`pull()`/`status()`,
+`ingest retry`/`watch`, watcher (`stager.watch()`), and the follow-on
+"§12 decision 2" limitation — entity/concept note embeddings are never
+refreshed after their first-mention content, even as the file itself
+accumulates more mentions (documented known v1 gap, `INGEST_PLAN.md`
+§12).
 
 ## Key decisions made this session
 
@@ -574,25 +576,92 @@ CLI test-fixture cleanup unrelated to `cascade()` itself).
   terminal), and `run`'s commit wiring being untestable end-to-end (now
   exercised for real, not via monkeypatch).
 
+## Session: entity/concept note fan-out — step 4b, second half (the actual "cascade")
+
+Picked up the piece deliberately sliced off last session. Asked two
+clarifying questions before coding (both recommended options chosen —
+see `INGEST_PLAN.md` §12): source notes stay wikilink-free this session
+(entity/concept side carries all the new linking), and entity/concept
+note embeddings are computed once at creation, never refreshed on later
+mentions. **153/153 tests passing** (was 142; +11).
+
+- **Mid-session correction, not part of the original plan**: after
+  drafting §12 with the literal "minimal stub" reading from last
+  session, the user flagged the obvious problem — `ExtractionResult`
+  only ever held bare entity/concept name strings, so a first-mention
+  note would have been genuinely empty (title + a "mentioned in" pointer,
+  no actual information). Rather than build that, asked a third
+  question: keep bare names, or make extraction richer? **User chose
+  richer extraction** — `ExtractionResult`/`Analysis.entities`/`.concepts`
+  became `list[Mention]` (`name` + a one-sentence `note` of what the
+  text says about it), still produced by `compile()`'s single existing
+  `extract()` call, no new LLM call. This changed `models.py`,
+  `llm/client.py` (prompt + schema), `storage/analysis_repo.py`
+  (JSON shape), and every test fixture touching entities/concepts —
+  caught and fixed before it became a production bug, not after.
+- `models.py`: new `Mention(name, note)`, shared by `Analysis` and
+  `llm.client.ExtractionResult` (one shape, not two).
+- `storage/notes_repo.py`: `update_note_row()` (new) — in-place
+  `tags`/`sources`/`content_hash`/`updated_at` update; `path`/`slug`/
+  `type`/`title` never change post-creation. 2 new tests.
+- `src/llm_wiki/compiler/notes.py`: `fan_out_mentions(item, analysis,
+  source_note, vault_root, storage, llm_client) -> list[Note]` (new).
+  Matches an extracted name to an existing note by `slugify(name)`
+  (case-insensitive merge for free — "Acme Corp" and "acme corp" land on
+  the same note; genuine entity resolution across different phrasings
+  like "Acme" vs. "Acme Corporation" is explicitly out of scope, §12).
+  New mention: writes a `wiki/entities/`/`wiki/concepts/{slug}.md` stub
+  (frontmatter + one "Mentioned in" bullet — date, `[[source-slug]]`
+  wikilink, source title, the `Mention.note` text), one chunk, embedded
+  once. Repeat mention: reads the existing file via `frontmatter.loads()`,
+  appends one bullet to the body, updates the frontmatter `sources` list
+  to match (DB and file never drift, per the "SQLite is a rebuildable
+  cache of `wiki/`" invariant), rewrites atomically — no chunk/embedding
+  touch (per the "embed once" decision). **Idempotent by construction**:
+  if `item.title` is already in the note's `sources`, the append is
+  skipped, so a `cascade()` crash-retry can't double-append a bullet.
+  Cross-type slug collisions (rare — an entity and an unrelated concept
+  happen to slugify the same) reuse §11's `-2`/`-3` suffixing rather than
+  a new mechanism. `_unique_slug()`/`_note_path()` refactored to be
+  type/folder-aware (`sources`/`entities`/`concepts`) so both
+  `write_source_note()` and the new fan-out share them. 13 new tests
+  (create, content/bullet shape, chunk+embedding-once, repeat-mention
+  append without re-embed, crash-retry idempotency, within-item dedup,
+  cross-type collision suffixing).
+- `ingest/cascade.py`: now calls `write_source_note()` then
+  `fan_out_mentions()` in the same `with storage.conn:` block as the
+  terminal `COMPLETED` write — one atomic "either the whole cascade
+  landed or none of it did" unit, same shape as before. 2 new tests
+  (fans out correctly; crash-retry doesn't duplicate a mention).
+- Manually verified the actual rendered output in the sandbox (not just
+  assertions) — confirmed `acme-corp.md` correctly merges a second
+  source's lowercase "acme corp" mention into the same note with both
+  dated bullets present, and that `[[wikilink]]`s point at the right
+  source slugs.
+- `INGEST_PLAN.md` §7's pool-re-offering gap note simplified now that
+  4b is fully done (no more "source notes only" caveat).
+
 ## Suggested next step
 
-Per `INGEST_PLAN.md` §9, items 1, 2, 3, 4a, 4b (source notes only), and 5
-are now done. What's left:
+Per `INGEST_PLAN.md` §9, items 1 through 5 are now fully done — the
+whole `STAGED`→`COMPLETED` pipeline runs end-to-end, including real
+entity/concept notes. What's left:
 
-- **Entity/concept note fan-out** — the actual "cascade" half of item 4b,
-  deliberately sliced off this session. Append-only merge algorithm
-  already decided (§10); first-cut note shape already decided (minimal
-  stub — frontmatter + a running "Mentioned in" list, no extra LLM call,
-  §11). What's still open: exactly which fields go in an entity/concept
-  note's frontmatter, and how `write_source_note()`'s output should
-  reference them (a `[[wikilink]]` format hasn't been designed yet) —
-  worth a short design round-trip before coding, same pattern as the last
-  two sessions.
 - **Item 6, the watcher** (`stager.watch()`, wired to `auto_watch_raw`)
   — last on purpose, a convenience layer over the already-proven
-  `stage()` + `add`/`run` path.
+  `stage()` + `add`/`run` path. The only remaining item in the original
+  build order.
 - `ingest retry`/`ingest watch` remain deferred per the design gaps noted
   in §7.
+- **`graph`/`lint` packages** — not started. Now that real
+  `[[wikilink]]`s exist in entity/concept notes (§12), `graph`'s
+  `wiki-link` pipeline (parse `[[wikilinks]]`, populate the `links`
+  table) has real content to work against for the first time.
+- Two documented, deliberately-deferred v1 limitations worth revisiting
+  eventually, not urgently: entity/concept note embeddings never refresh
+  after first creation (§12 decision 2), and note file writes aren't
+  atomic together with their DB commit (§11) — both call out "revisit if
+  it proves to matter in practice."
 - Real end-to-end manual smoke-testing of `compile()`/`cascade()` against
   an actual running `llama-server` still hasn't happened (no server
   reachable in this sandbox) — worth doing on the user's machine once

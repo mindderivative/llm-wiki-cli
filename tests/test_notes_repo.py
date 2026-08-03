@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from llm_wiki.models import Note, NoteType
-from llm_wiki.storage import StorageEngine, get_note_row_by_slug, insert_note_row
+from llm_wiki.storage import StorageEngine, get_note_row_by_slug, insert_note_row, update_note_row
 
 
 @pytest.fixture
@@ -52,3 +52,31 @@ def test_insert_duplicate_slug_raises(storage: StorageEngine):
     with pytest.raises(sqlite3.IntegrityError):
         with storage.conn:
             insert_note_row(storage, _note(slug="dup", title="Different title"))
+
+
+def test_update_note_row_persists_new_sources_and_hash(storage: StorageEngine):
+    with storage.conn:
+        inserted = insert_note_row(storage, _note())
+
+    updated = inserted.model_copy(
+        update={"sources": ["some source", "another source"], "content_hash": "newhash"}
+    )
+    with storage.conn:
+        update_note_row(storage, updated)
+
+    fetched = get_note_row_by_slug(storage, "acme-corp")
+    assert fetched.sources == ["some source", "another source"]
+    assert fetched.content_hash == "newhash"
+
+
+def test_update_note_row_does_not_change_slug_or_type(storage: StorageEngine):
+    with storage.conn:
+        inserted = insert_note_row(storage, _note())
+
+    updated = inserted.model_copy(update={"content_hash": "newhash"})
+    with storage.conn:
+        update_note_row(storage, updated)
+
+    fetched = get_note_row_by_slug(storage, "acme-corp")
+    assert fetched.slug == "acme-corp"
+    assert fetched.type == NoteType.SOURCE

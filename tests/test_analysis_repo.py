@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from llm_wiki.models import Analysis, QueueItem
+from llm_wiki.models import Analysis, Mention, QueueItem
 from llm_wiki.storage import StorageEngine, get_analysis_row, insert_queue_row, upsert_analysis_row
 
 
@@ -30,8 +30,8 @@ def test_upsert_then_get_round_trips(storage: StorageEngine):
     analysis = Analysis(
         queue_item_id=item.id,
         summary="A concise summary.",
-        entities=["Acme Corp"],
-        concepts=["supply chain risk"],
+        entities=[Mention(name="Acme Corp", note="Central vendor in this source.")],
+        concepts=[Mention(name="supply chain risk", note="Discussed as the main threat.")],
     )
 
     with storage.conn:
@@ -39,24 +39,31 @@ def test_upsert_then_get_round_trips(storage: StorageEngine):
 
     fetched = get_analysis_row(storage, item.id)
     assert fetched.summary == "A concise summary."
-    assert fetched.entities == ["Acme Corp"]
-    assert fetched.concepts == ["supply chain risk"]
+    assert fetched.entities == [Mention(name="Acme Corp", note="Central vendor in this source.")]
+    assert fetched.concepts == [Mention(name="supply chain risk", note="Discussed as the main threat.")]
 
 
 def test_upsert_overwrites_previous_attempt(storage: StorageEngine):
     item = _insert_queue_item(storage)
     with storage.conn:
         upsert_analysis_row(
-            storage, Analysis(queue_item_id=item.id, summary="first attempt", entities=["A"])
+            storage,
+            Analysis(queue_item_id=item.id, summary="first attempt", entities=[Mention(name="A", note="n")]),
         )
         upsert_analysis_row(
-            storage, Analysis(queue_item_id=item.id, summary="retried attempt", entities=["B"], concepts=["C"])
+            storage,
+            Analysis(
+                queue_item_id=item.id,
+                summary="retried attempt",
+                entities=[Mention(name="B", note="n")],
+                concepts=[Mention(name="C", note="n")],
+            ),
         )
 
     fetched = get_analysis_row(storage, item.id)
     assert fetched.summary == "retried attempt"
-    assert fetched.entities == ["B"]
-    assert fetched.concepts == ["C"]
+    assert fetched.entities == [Mention(name="B", note="n")]
+    assert fetched.concepts == [Mention(name="C", note="n")]
 
 
 def test_analysis_defaults_to_empty_lists(storage: StorageEngine):

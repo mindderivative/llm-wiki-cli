@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
-from llm_wiki.models import Analysis
+from llm_wiki.models import Analysis, Mention
 from llm_wiki.storage.engine import StorageEngine
 
 
@@ -31,8 +31,8 @@ def upsert_analysis_row(storage: StorageEngine, analysis: Analysis) -> Analysis:
         (
             analysis.queue_item_id,
             analysis.summary,
-            json.dumps(analysis.entities),
-            json.dumps(analysis.concepts),
+            json.dumps([mention.model_dump() for mention in analysis.entities]),
+            json.dumps([mention.model_dump() for mention in analysis.concepts]),
             analysis.created_at.isoformat(),
         ),
     )
@@ -51,7 +51,7 @@ def get_analysis_row(storage: StorageEngine, queue_item_id: int) -> Analysis | N
     return Analysis(
         queue_item_id=row["queue_item_id"],
         summary=row["summary"],
-        entities=json.loads(row["entities"]),
-        concepts=json.loads(row["concepts"]),
+        entities=[Mention(**m) for m in json.loads(row["entities"])],
+        concepts=[Mention(**m) for m in json.loads(row["concepts"])],
         created_at=datetime.fromisoformat(row["created_at"]),
     )

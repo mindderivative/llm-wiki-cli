@@ -4,7 +4,7 @@ import pytest
 
 from llm_wiki.ingest.compile import compile
 from llm_wiki.llm.client import ExtractionResult
-from llm_wiki.models import Chunk, CompilationError, QueueItem, QueueStatus
+from llm_wiki.models import Chunk, CompilationError, Mention, QueueItem, QueueStatus
 from llm_wiki.storage import (
     StorageEngine,
     get_analysis_row,
@@ -63,15 +63,19 @@ def _item_with_chunk(storage: StorageEngine, *, status: QueueStatus = QueueStatu
 
 def test_compile_advances_parsed_to_analyzed(storage: StorageEngine):
     item = _item_with_chunk(storage)
-    llm = FakeLlmClient(summary="Acme summary", entities=["Acme Corp"], concepts=["supply chain"])
+    llm = FakeLlmClient(
+        summary="Acme summary",
+        entities=[Mention(name="Acme Corp", note="Central vendor.")],
+        concepts=[Mention(name="supply chain", note="Main topic.")],
+    )
 
     result = compile(item, storage, llm)
 
     assert result.status == QueueStatus.ANALYZED
     analysis = get_analysis_row(storage, item.id)
     assert analysis.summary == "Acme summary"
-    assert analysis.entities == ["Acme Corp"]
-    assert analysis.concepts == ["supply chain"]
+    assert analysis.entities == [Mention(name="Acme Corp", note="Central vendor.")]
+    assert analysis.concepts == [Mention(name="supply chain", note="Main topic.")]
 
 
 def test_compile_retries_from_analyzing(storage: StorageEngine):
