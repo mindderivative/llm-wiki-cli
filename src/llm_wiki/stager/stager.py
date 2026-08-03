@@ -16,7 +16,6 @@ both, in sequence, wherever staging actually gets triggered from (CLI
 
 from __future__ import annotations
 
-import re
 import shutil
 from pathlib import Path
 
@@ -24,8 +23,7 @@ from loguru import logger
 
 from llm_wiki.models import IngestionError, QueueItem, QueueStatus, utcnow
 from llm_wiki.storage import StorageEngine, insert_queue_row
-
-_SLUG_RE = re.compile(r"[^a-z0-9]+")
+from llm_wiki.textutil import slugify
 
 
 def stage(source_path: Path, vault_root: Path, storage: StorageEngine) -> QueueItem:
@@ -54,7 +52,7 @@ def stage(source_path: Path, vault_root: Path, storage: StorageEngine) -> QueueI
         staged_dir.mkdir(parents=True, exist_ok=True)
 
         date_str = utcnow().strftime("%Y-%m-%d")
-        slug = _slugify(source_path.stem)
+        slug = slugify(source_path.stem)
 
         archive_path = _unique_path(sources_dir / f"{date_str}_{source_path.name}")
         staged_path = _unique_path(staged_dir / f"{date_str}_{slug}{source_path.suffix}")
@@ -83,11 +81,6 @@ def stage(source_path: Path, vault_root: Path, storage: StorageEngine) -> QueueI
     )
     with storage.conn:
         return insert_queue_row(storage, item)
-
-
-def _slugify(text: str) -> str:
-    slug = _SLUG_RE.sub("-", text.lower()).strip("-")
-    return slug or "untitled"
 
 
 def _unique_path(path: Path) -> Path:

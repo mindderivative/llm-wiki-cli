@@ -6,10 +6,7 @@ from typer.testing import CliRunner
 
 import llm_wiki.cli as cli_module
 from llm_wiki.cli import app
-from llm_wiki.ingest import pipeline as ingest_pipeline
 from llm_wiki.llm.client import ExtractionResult
-from llm_wiki.models import QueueStatus
-from llm_wiki.storage import update_queue_row
 from llm_wiki.vault import VaultManager
 
 runner = CliRunner()
@@ -28,8 +25,14 @@ def _clear_proxy_env(monkeypatch):
 
 
 class FakeLlmClient:
-    """Trivial `LlmClient` double so real `compile()` can succeed without
-    a live `llama-server` -- see `with_fake_llm_client` below."""
+    """Trivial `LlmClient` double so real `compile()`/`cascade()` can
+    both succeed without a live `llama-server` -- see
+    `with_fake_llm_client` below. `embed()` needs real-shaped (if fake)
+    vectors now that `cascade()` is real too (INGEST_PLAN.md §11) and
+    calls it while writing a source note -- 768-wide to match
+    `DEFAULT_EMBEDDING_DIM`, which is what `vault_root`'s `StorageEngine`
+    actually created `vec_chunks` with (a mismatched width would be a
+    real `sqlite-vec` dimension error, not just a fake-data nitpick)."""
 
     def summarize(self, text: str) -> str:
         return "a summary"
@@ -38,34 +41,16 @@ class FakeLlmClient:
         return ExtractionResult(entities=[], concepts=[])
 
     def embed(self, texts: list[str]) -> list[list[float]]:
-        raise NotImplementedError
+        return [[0.1] * 768 for _ in texts]
 
 
 @pytest.fixture
 def with_fake_llm_client(monkeypatch):
     """Monkeypatches `llm_wiki.cli.LlamaClient` (what `_dispatch_table()`
-    constructs) so `ingest step`/`run` drive real `compile()` against a
-    fake client instead of trying to reach an actual `llama-server`."""
+    constructs) so `ingest step`/`run` drive real `compile()`/`cascade()`
+    against a fake client instead of trying to reach an actual
+    `llama-server`."""
     monkeypatch.setattr(cli_module, "LlamaClient", lambda config: FakeLlmClient())
-
-
-def _fake_cascade(item, storage):
-    """Stand-in for the not-yet-built `cascade()` (INGEST_PLAN.md §10):
-    flips ANALYZED straight to COMPLETED so run's batch-end commit
-    wiring can be exercised end-to-end before cascade() exists.
-    `compile()` (`PARSED` -> `ANALYZED`) is real now -- this only stands
-    in for the one step still missing."""
-    completed = item.model_copy(update={"status": QueueStatus.COMPLETED})
-    with storage.conn:
-        return update_queue_row(storage, completed)
-
-
-@pytest.fixture
-def with_fake_cascade_step(monkeypatch):
-    """Registers `_fake_cascade` for ANALYZED for the duration of one
-    test. Safe to combine with `with_fake_llm_client` -- `build_pipeline()`
-    only ever overwrites PARSED/ANALYZING, so this entry survives."""
-    monkeypatch.setitem(ingest_pipeline._STEP_FOR_STATUS, QueueStatus.ANALYZED, _fake_cascade)
 
 
 @pytest.fixture
@@ -121,9 +106,8 @@ def test_list_status_filter(tmp_path: Path, vault_root: Path, with_fake_llm_clie
     _add(vault_root, _write(tmp_path, "good.txt"))
     _add(vault_root, _write(tmp_path, "bad.pdf"))
     # Drive both as far as they'll go -- "bad.pdf" isn't a supported
-    # format (fails in atomize()); "good.txt" reaches ANALYZED via the
-    # fake LLM client (cascade() doesn't exist yet, so that's as far as
-    # even a successful item gets -- see INGEST_PLAN.md §10).
+    # format (fails in atomize()); "good.txt" reaches COMPLETED via the
+    # fake LLM client (compile() + cascade(), §10/§11).
     runner.invoke(app, ["ingest", "run", "--count", "AUTO", "--vault", str(vault_root)])
 
     result = runner.invoke(app, ["ingest", "list", "--status", "FAILED", "--vault", str(vault_root)])
@@ -192,8 +176,8 @@ def test_run_explicit_id_to_completion(tmp_path: Path, vault_root: Path, with_fa
     result = runner.invoke(app, ["ingest", "run", "1", "--vault", str(vault_root)])
 
     assert result.exit_code == 0
-    assert "ANALYZED" in result.stdout  # as far as the pipeline currently goes (§10)
-    assert "No commit performed" in result.stdout
+    assert "COMPLETED" in result.stdout  # cascade() now runs for real (§11)
+    assert "Committed" in result.stdout
 
 
 def test_run_count_auto_drains_pool(tmp_path: Path, vault_root: Path, with_fake_llm_client):
@@ -204,7 +188,7 @@ def test_run_count_auto_drains_pool(tmp_path: Path, vault_root: Path, with_fake_
 
     assert result.exit_code == 0
     list_result = runner.invoke(app, ["ingest", "list", "--vault", str(vault_root)])
-    assert list_result.stdout.count("ANALYZED") == 2
+    assert list_result.stdout.count("COMPLETED") == 2
 
 
 def test_run_stops_on_failure(tmp_path: Path, vault_root: Path):
@@ -222,9 +206,7 @@ def test_run_stops_on_failure(tmp_path: Path, vault_root: Path):
     assert "STAGED" in status_result.stdout
 
 
-def test_run_commits_completed_items(
-    tmp_path: Path, vault_root: Path, with_fake_llm_client, with_fake_cascade_step
-):
+def test_run_commits_completed_items(tmp_path: Path, vault_root: Path, with_fake_llm_client):
     _add(vault_root, _write(tmp_path, "note.txt"))
 
     result = runner.invoke(app, ["ingest", "run", "--count", "AUTO", "--vault", str(vault_root)])
@@ -237,9 +219,7 @@ def test_run_commits_completed_items(
     assert commits[0].message == "ingest: note"
 
 
-def test_run_commit_message_lists_multiple_titles(
-    tmp_path: Path, vault_root: Path, with_fake_llm_client, with_fake_cascade_step
-):
+def test_run_commit_message_lists_multiple_titles(tmp_path: Path, vault_root: Path, with_fake_llm_client):
     _add(vault_root, _write(tmp_path, "one.txt"))
     _add(vault_root, _write(tmp_path, "two.txt"))
 
@@ -253,7 +233,7 @@ def test_run_commit_message_lists_multiple_titles(
 
 
 def test_run_commits_only_items_completed_before_failure(
-    tmp_path: Path, vault_root: Path, with_fake_llm_client, with_fake_cascade_step
+    tmp_path: Path, vault_root: Path, with_fake_llm_client
 ):
     _add(vault_root, _write(tmp_path, "good.txt"))
     _add(vault_root, _write(tmp_path, "bad.pdf"))  # unsupported format -> FAILED

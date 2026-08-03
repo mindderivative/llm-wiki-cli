@@ -57,26 +57,28 @@ before any interface (CLI/MCP/GUI). No cloud LLM SDKs — local
 
 ## What's built so far
 
-All under `src/llm_wiki/`, with tests in `tests/`. **119/119 tests passing**
+All under `src/llm_wiki/`, with tests in `tests/`. **142/142 tests passing**
 against the real `~/pyDev/venv` interpreter as of this session.
 
 | Module | File(s) | Status |
 |---|---|---|
-| Package scaffold | `pyproject.toml`, `src/llm_wiki/{vault,stager,ingest,llm,compiler,graph,lint,vcs,storage}/__init__.py` | Done — subpackages beyond `storage`/`vault`/`stager`/`ingest`/`vcs`/`llm` are docstring-only stubs, not implemented |
+| Package scaffold | `pyproject.toml`, `src/llm_wiki/{vault,stager,ingest,llm,compiler,graph,lint,vcs,storage}/__init__.py` | Done — subpackages beyond `storage`/`vault`/`stager`/`ingest`/`vcs`/`llm`/`compiler` are docstring-only stubs, not implemented |
 | `config` | `config.py` | Done — `LlamaServerConfig`, `VaultSettings` (load/save `.llm-wiki-config`, derived path properties) |
-| `models` | `models.py` | Done — `QueueItem` (10-value `QueueStatus`, `failed_at_step`, defaults to `STAGED`), `Note`, `Chunk`, `Analysis` (new this session — `queue_analysis` row), `Link`, `LintFinding`; typed exception hierarchy (`VaultNotFoundError`, `StorageError`, `IngestionError`, `CompilationError`, `GitError`, etc.); public `utcnow()` helper |
-| `storage` | `storage/{schema,engine,queue_repo,chunk_repo,analysis_repo}.py` | Done — `StorageEngine`: connect/init_schema/rebuild/close, best-effort `sqlite-vec` loading, FK + CHECK constraints verified against real SQLite. Schema version 3 (new this session — `queue_analysis` table). `queue_repo`/`chunk_repo`/`analysis_repo`: shared row (de)serialization, no internal `.commit()` (callers wrap writes in `with storage.conn:`). `chunk_repo` has `list_chunks_for_queue_item` (new — ordered by `ordinal`); `analysis_repo` has `upsert_analysis_row`/`get_analysis_row` (new, `INSERT OR REPLACE`) |
+| `models` | `models.py` | Done — `QueueItem` (10-value `QueueStatus`, `failed_at_step`, defaults to `STAGED`), `Note`, `Chunk`, `Analysis`, `Link`, `LintFinding`; typed exception hierarchy (`VaultNotFoundError`, `StorageError`, `IngestionError`, `CompilationError`, `GitError`, etc.); public `utcnow()` helper |
+| `textutil` | `textutil.py` (**new this session**) | `slugify(text)` — shared out of `stager`'s old private copy, now also used by `compiler.write_source_note()` |
+| `storage` | `storage/{schema,engine,queue_repo,chunk_repo,analysis_repo,notes_repo}.py` | Done — `StorageEngine`: connect/init_schema/rebuild/close, best-effort `sqlite-vec` loading, FK + CHECK constraints verified against real SQLite. Schema version 3. `queue_repo`/`chunk_repo`/`analysis_repo`/`notes_repo` (**new this session**): shared row (de)serialization, no internal `.commit()` (callers wrap writes in `with storage.conn:`). `chunk_repo` gained `insert_embedding()` (**new** — writes into `vec_chunks` via `sqlite_vec.serialize_float32()`, no-ops if `vec_available` is false) |
 | `vault` | `vault/manager.py` | Done — `VaultManager`: create/load/validate vault trees, seeds `wiki/index.md`/`log.md`/`SCHEMA.md`, wires in `StorageEngine` on create, cross-vault recent-vaults list (path injectable for tests). **Does not `git init` the vault** — lazy, on first real commit |
 | `stager` | `stager/{stager,cleanup}.py` | Done — `stage()`/`verify_and_clean()`, composed by `wiki-cli ingest add`. Step 1 of the pipeline only. 10 tests |
-| `llm` | `llm/client.py` (**new this session**) | `LlamaClient`: wraps `llama-server`'s OpenAI-compatible endpoint via `openai` (chat + embeddings) and `outlines` (grammar-constrained structured extraction). `LlmClient` — a narrow `Protocol`, not an ABC — is what `ingest.compile()` actually depends on, so tests inject a trivial fake without touching `outlines`/`openai`. `summarize()`, `extract() -> ExtractionResult`, `embed()` (not consumed yet — `cascade()`'s job later). 11 tests, including real `outlines` integration exercised via `MagicMock(spec=openai.OpenAI)` (a bare duck-typed fake fails `outlines.from_openai()`'s real `isinstance` check) |
-| `ingest` | `ingest/{accept,atomize,compile,pipeline}.py` | `accept()` (step 2), `atomize()` (step 3, plaintext/Markdown chunking via `markdown-it-py`). `compile()` (step 4, **new this session** — `PARSED`→`ANALYZING`→`ANALYZED`: reads `atomize()`'s chunks, calls `llm_client.summarize()`/`.extract()`, commits a `queue_analysis` row). `pipeline.py`: `step_once()`/`advance()` dispatcher + `build_pipeline(llm_client)` (**new** — binds `compile()`'s extra dependency in via `functools.partial` without leaking it into `accept()`/`atomize()`'s signatures; omit it and you get the base table, unchanged, so old call sites/tests still work). Nothing registered past `ANALYZED` yet (`cascade()` doesn't exist — item 4b, deliberately deferred). 24 tests (12 accept/atomize + 6 `compile()` + 6 dispatcher) |
-| `vcs` | `vcs/engine.py` | `GitEngine`: `init()` (idempotent) + `commit(message)` (stages `raw/`+`wiki/`, no-ops if nothing changed). `push()`/`pull()`/`status()` deliberately not built. 9 tests |
-| CLI | `cli.py`, `__main__.py` | `vault` group (smoke-tested only). `ingest` group: `add`, `list`, `status` (now shows `summary`/`entities`/`concepts` once `ANALYZED`), `step`, `run` — both `step`/`run` now build a real `LlamaClient` + dispatch table per invocation (`_dispatch_table()`), so `compile()` genuinely runs, no CLI flag needed to opt in. `run` commits via `GitEngine` once anything reaches `COMPLETED` (still can't fire for real — nothing reaches `COMPLETED` until `cascade()` exists). `retry`/`watch` still deliberately not built. 19 CLI tests via `typer.testing.CliRunner` |
+| `llm` | `llm/client.py` | `LlamaClient`: wraps `llama-server`'s OpenAI-compatible endpoint via `openai` (chat + embeddings) and `outlines` (grammar-constrained structured extraction). `LlmClient` — a narrow `Protocol`, not an ABC. `summarize()`, `extract() -> ExtractionResult`, `embed()` (now actually consumed, by `compiler.write_source_note()`). 11 tests, including real `outlines` integration exercised via `MagicMock(spec=openai.OpenAI)` (a bare duck-typed fake fails `outlines.from_openai()`'s real `isinstance` check) |
+| `compiler` | `compiler/notes.py` (**new this session**) | `write_source_note(item, analysis, vault_root, storage, llm_client) -> Note` — builds `wiki/sources/{slug}.md` (frontmatter + summary + source pointer) via `python-frontmatter`, write-temp-then-rename, inserts `notes`+`chunks`+embeds via `insert_embedding()`. Slug collisions (DB + filesystem) resolved with a `-2`/`-3`... suffix, same pattern `stager.stage()` uses. Deliberately excludes entities/concepts from note content — no linking format invented yet. 6 tests |
+| `ingest` | `ingest/{accept,atomize,compile,cascade,pipeline}.py` | `accept()` (step 2), `atomize()` (step 3). `compile()` (step 4, `PARSED`→`ANALYZING`→`ANALYZED`: summarize+extract via `LlmClient`, commits a `queue_analysis` row). `cascade()` (step 5, **new this session** — `ANALYZED`→`CASCADING`→`COMPLETED`: reads the `queue_analysis` row, calls `compiler.write_source_note()`, goes straight to `COMPLETED` with no separate durable `CASCADED` resting state — see `INGEST_PLAN.md` §11. Entity/concept note fan-out — the actual "cascade" half — is **not** built yet, deferred to its own session). `pipeline.py`: `step_once()`/`advance()` dispatcher + `build_pipeline(llm_client, vault_root)` (**vault_root new this session** — `cascade()` only gets bound in when both dependencies are present). 37 tests (12 accept/atomize + 6 `compile()` + 7 `cascade()` + 12 dispatcher) |
+| `vcs` | `vcs/engine.py` | `GitEngine`: `init()` (idempotent) + `commit(message)` (stages `raw/`+`wiki/`, no-ops if nothing changed). `push()`/`pull()`/`status()` deliberately not built. **Now exercisable end-to-end for real** — items genuinely reach `COMPLETED` since `cascade()` exists. 9 tests |
+| CLI | `cli.py`, `__main__.py` | `vault` group (smoke-tested only). `ingest` group: `add`, `list`, `status` (shows `summary`/`entities`/`concepts` once `ANALYZED`), `step`, `run` — `step`/`run` build a real `LlamaClient` + full dispatch table (`compile()` + `cascade()`) per invocation (`_dispatch_table()`), so items now genuinely drive all the way to `COMPLETED` and `run`'s batch-end commit fires for real. `retry`/`watch` still deliberately not built. 19 CLI tests via `typer.testing.CliRunner` |
 
-Not started: `ingest` step 5 (`cascade()`, `ANALYZED`→`COMPLETED` — needs
-`compiler`, deliberately deferred, see this session's summary),
-`compiler`, `graph`, `lint`, `vcs.push()`/`pull()`/`status()`,
-`ingest retry`/`watch`, watcher (`stager.watch()`).
+Not started: entity/concept note fan-out (the append-only "cascade"
+half of item 4b — decided, not yet built, see `INGEST_PLAN.md` §11),
+`graph`, `lint`, `vcs.push()`/`pull()`/`status()`, `ingest retry`/`watch`,
+watcher (`stager.watch()`).
 
 ## Key decisions made this session
 
@@ -488,26 +490,112 @@ tests passing** (was 89; +30).
   test_ingest_pipeline.py` (+4 — `build_pipeline()`/`dispatch_table`),
   `tests/test_cli_ingest.py` (+2 net after the rework above).
 
+## Session: compiler package + ingest.cascade() — step 4b, source notes only
+
+Picked up `INGEST_PLAN.md` §9 item 4b. Before writing code, asked the
+user two clarifying questions (same pattern as the `compile()` session):
+whether this session builds source notes only or the full entity/concept
+cascade too (**user chose source notes only** — the entity/concept fan-out
+is its own future session), and whether a first-mentioned entity/concept's
+note should be a minimal stub or an LLM-drafted blurb (**user chose
+minimal stub**, locked in now even though it isn't built this session, so
+it won't need relitigating later). See `INGEST_PLAN.md` §11 for the full
+design writeup. **142/142 tests passing** (was 119; +23 net after +3 for a
+CLI test-fixture cleanup unrelated to `cascade()` itself).
+
+- `src/llm_wiki/textutil.py` (new): `slugify()`, moved out of
+  `stager/stager.py`'s private `_slugify` — `compiler.write_source_note()`
+  needed the identical logic for note slugs, so centralized it (same
+  "centralize once a second real consumer exists" call as `queue_repo`
+  back in §9 item 2). 5 tests.
+- `storage/notes_repo.py` (new): `insert_note_row()`/`get_note_row_by_slug()`.
+  `chunk_repo.py` gained `insert_embedding(storage, chunk_id, vector)` —
+  verified the actual `sqlite-vec` insert mechanics in the sandbox first
+  (`sqlite_vec.serialize_float32(vector)` then `INSERT INTO
+  vec_chunks(rowid, embedding) VALUES (?, ?)`, `rowid` = `chunks.id`), and
+  found empirically that vector width must match `StorageEngine`'s
+  configured `embedding_dim` or `sqlite-vec` raises a dimension-mismatch
+  error — test fixtures now build `StorageEngine(..., embedding_dim=4)`
+  to match their small test vectors. 3 + 2 tests.
+- `src/llm_wiki/compiler/notes.py` (new package): `write_source_note(item,
+  analysis, vault_root, storage, llm_client) -> Note`. ARCHITECTURE.md §7
+  already reserved `compiler` for this; `compile()` didn't end up needing
+  it (nothing package-worthy to factor out), but note-writing is genuinely
+  reusable logic with a real second consumer (`cascade()`) from day one.
+  Slug from `slugify(item.title)`, collision-checked against both the
+  `notes` table and the filesystem (suffix `-2`, `-3`... — same pattern
+  `stager.stage()` already uses), written via `python-frontmatter` +
+  write-temp-then-`Path.replace()` (atomic rename), one chunk for the
+  whole note (its body *is* the summary — chunking further would
+  manufacture structure that isn't there), embedded via
+  `llm_client.embed()`. Deliberately excludes entities/concepts from the
+  note body — inventing a `[[wikilink]]` format before the entity/concept
+  session exists felt premature. 6 tests.
+- `src/llm_wiki/ingest/cascade.py` (new): `cascade(item, storage,
+  llm_client, vault_root)` — step 5, `ANALYZED`→`CASCADING`→`COMPLETED`.
+  Same two-phase atomicity pattern as `atomize()`/`compile()` (durable
+  `CASCADING` marker first, crash-retry accepts `ANALYZED` or
+  `CASCADING`). **New decision**: the terminal write is `COMPLETED`
+  directly — no separate durable `CASCADED` resting state, since nothing
+  in this source-notes-only cut ever needs to observe "note written, not
+  yet marked complete" as its own state (unlike `PARSING`→`PARSED`, where
+  real committed output actually differs). The `CASCADED` enum value
+  stays defined for schema completeness / a future split. Fails cleanly
+  (`FAILED`/`failed_at_step=CASCADING`) if no `queue_analysis` row exists
+  (e.g. `compile()` never ran) or if `write_source_note()` raises
+  `OSError`/`CompilationError`. 7 tests, including one confirming the
+  `notes`/`chunks` inserts roll back together with an embed failure since
+  the whole thing runs inside one `with storage.conn:` block.
+- `pipeline.py`: `build_pipeline()` gained a `vault_root` parameter —
+  `cascade()` needs it (to know where `wiki/` is) in addition to
+  `llm_client`, so it's only bound into the dispatch table when *both*
+  are given. `cli.py`'s `_dispatch_table()` now passes both.
+- **Known gap, documented not solved**: the note file write and the DB
+  transaction commit aren't atomic *together* (each is atomic on its
+  own). A crash between them leaves a harmless orphaned `.md` file on
+  disk — the slug-collision check makes a retry safe (creates a new file
+  rather than corrupting the orphan), so the only cost is disk litter.
+  Same category of gap as `stager`'s pre-`verify_and_clean()` problem;
+  building the equivalent for `cascade()` was judged scope creep for a
+  first cut. See `INGEST_PLAN.md` §11's closing section.
+- `tests/test_cli_ingest.py`: wiring `cascade()` in for real surfaced 6
+  failures — the shared `FakeLlmClient.embed()` was still a leftover
+  `NotImplementedError` stub from before `cascade()` existed, and its
+  fake vectors needed to be 768-wide to match the vault fixtures' real
+  `DEFAULT_EMBEDDING_DIM` (not a `StorageEngine` monkeypatch — simpler to
+  just make the fake vectors the right shape). The now-obsolete
+  `with_fake_cascade_step` stand-in fixture was removed entirely (real
+  `cascade()` replaces it); three tests' stale "`ANALYZED`"/"`No commit
+  performed`" assertions updated to "`COMPLETED`"/"`Committed`" since the
+  pipeline now genuinely completes end-to-end.
+- Several `INGEST_PLAN.md` §7 gaps resolved as a direct consequence:
+  cascade write atomicity (now built, with the one documented residual
+  gap above), the pool re-offering `ANALYZED` items forever (now
+  terminal), and `run`'s commit wiring being untestable end-to-end (now
+  exercised for real, not via monkeypatch).
+
 ## Suggested next step
 
-Per `INGEST_PLAN.md` §9, items 1, 2, 3, 4a, and 5 are now done. What's left:
+Per `INGEST_PLAN.md` §9, items 1, 2, 3, 4a, 4b (source notes only), and 5
+are now done. What's left:
 
-- **Item 4b, `cascade()`** (`ANALYZED`→`CASCADING`→`CASCADED`→`COMPLETED`)
-  — the last piece before `run`'s commit wiring can fire for real. Needs
-  a new `compiler` package. Merge algorithm already decided
-  (append-only, §10) so that part doesn't need relitigating. This is
-  also where `wiki/` note frontmatter/content shape for entities/
-  concepts gets designed concretely — worth another short design
-  round-trip before coding, same pattern as this session, since it's
-  still a real open question exactly what fields/sections a first-cut
-  entity/concept note has.
+- **Entity/concept note fan-out** — the actual "cascade" half of item 4b,
+  deliberately sliced off this session. Append-only merge algorithm
+  already decided (§10); first-cut note shape already decided (minimal
+  stub — frontmatter + a running "Mentioned in" list, no extra LLM call,
+  §11). What's still open: exactly which fields go in an entity/concept
+  note's frontmatter, and how `write_source_note()`'s output should
+  reference them (a `[[wikilink]]` format hasn't been designed yet) —
+  worth a short design round-trip before coding, same pattern as the last
+  two sessions.
 - **Item 6, the watcher** (`stager.watch()`, wired to `auto_watch_raw`)
   — last on purpose, a convenience layer over the already-proven
   `stage()` + `add`/`run` path.
 - `ingest retry`/`ingest watch` remain deferred per the design gaps noted
   in §7.
-- Real end-to-end manual smoke-testing of `compile()` against an actual
-  running `llama-server` still hasn't happened (no server reachable in
-  this sandbox) — worth doing on the user's machine once convenient, to
-  sanity-check the summarize/extract prompts actually produce sensible
-  output against a real local model, not just against mocks.
+- Real end-to-end manual smoke-testing of `compile()`/`cascade()` against
+  an actual running `llama-server` still hasn't happened (no server
+  reachable in this sandbox) — worth doing on the user's machine once
+  convenient, to sanity-check the summarize/extract/embed calls actually
+  produce sensible output against a real local model, not just against
+  mocks.

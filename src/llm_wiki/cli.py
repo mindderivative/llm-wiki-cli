@@ -156,10 +156,13 @@ def _open_vault(vault_path: Path) -> Iterator[tuple[VaultSettings, StorageEngine
 def _dispatch_table(settings: VaultSettings):
     """A fresh `LlamaClient` (from this vault's `llama` config) plus the
     dispatch table it enables — constructing the client never makes a
-    network call, only actually running `compile()` on an item does, so
-    it's cheap to build unconditionally on every `step`/`run` invocation
-    rather than threading a lazily-constructed one through."""
-    return build_pipeline(LlamaClient(settings.llama))
+    network call, only actually running `compile()`/`cascade()` on an
+    item does, so it's cheap to build unconditionally on every
+    `step`/`run` invocation rather than threading a lazily-constructed
+    one through. `vault_root` is what additionally unlocks `cascade()`
+    (INGEST_PLAN.md §11) — `build_pipeline()` only binds it in when both
+    are present."""
+    return build_pipeline(LlamaClient(settings.llama), settings.vault_root)
 
 
 def _parse_status(value: str) -> QueueStatus:

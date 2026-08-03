@@ -1,13 +1,19 @@
-"""`Chunk` <-> `chunks` row insert.
+"""`Chunk` <-> `chunks` row insert, plus `vec_chunks` embedding writes.
 
 Same pattern as `queue_repo.py`: no internal `.commit()`, callers own the
 transaction boundary. `ingest.atomize()` inserts a queue item's chunks
 and writes its terminal `PARSED` status inside one `with storage.conn:`
 block, so partial output can never outlive a crash without its status
 reflecting it (INGEST_PLAN.md §3, atomicity contract).
+
+`insert_embedding()` mechanics (rowid-joined virtual table, serialized
+float32 blob) were verified directly against a real `StorageEngine` in
+the sandbox before being written here — see INGEST_PLAN.md §11.
 """
 
 from __future__ import annotations
+
+import sqlite_vec
 
 from llm_wiki.models import Chunk
 from llm_wiki.storage.engine import StorageEngine
@@ -30,6 +36,22 @@ def insert_chunk_row(storage: StorageEngine, chunk: Chunk) -> Chunk:
         ),
     )
     return chunk.model_copy(update={"id": cursor.lastrowid})
+
+
+def insert_embedding(storage: StorageEngine, chunk_id: int, vector: list[float]) -> None:
+    """Write `vector` into `vec_chunks`, joined to `chunks.id` by rowid.
+
+    No-ops if `storage.vec_available` is `False` — the optional
+    `sqlite-vec` extension didn't load, so there's no `vec_chunks` table
+    to write into (`StorageEngine._try_load_vec()` already degrades
+    gracefully; this mirrors that rather than raising).
+    """
+    if not storage.vec_available:
+        return
+    storage.conn.execute(
+        "INSERT INTO vec_chunks (rowid, embedding) VALUES (?, ?);",
+        (chunk_id, sqlite_vec.serialize_float32(vector)),
+    )
 
 
 def list_chunks_for_queue_item(storage: StorageEngine, queue_item_id: int) -> list[Chunk]:

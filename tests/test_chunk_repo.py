@@ -6,6 +6,7 @@ from llm_wiki.models import Chunk, QueueItem
 from llm_wiki.storage import (
     StorageEngine,
     insert_chunk_row,
+    insert_embedding,
     insert_queue_row,
     list_chunks_for_queue_item,
 )
@@ -13,7 +14,10 @@ from llm_wiki.storage import (
 
 @pytest.fixture
 def storage(tmp_path: Path):
-    with StorageEngine(tmp_path / "db.sqlite3") as engine:
+    # embedding_dim=4 -- matches the tiny test vectors used below; the
+    # real default (768) doesn't matter for these tests and would just
+    # force longer fake vectors for no benefit.
+    with StorageEngine(tmp_path / "db.sqlite3", embedding_dim=4) as engine:
         engine.init_schema()
         yield engine
 
@@ -55,3 +59,27 @@ def test_list_chunks_for_queue_item_excludes_other_items(storage: StorageEngine)
     chunks = list_chunks_for_queue_item(storage, mine.id)
 
     assert [c.title for c in chunks] == ["mine"]
+
+
+# -- insert_embedding ---------------------------------------------------
+
+
+def test_insert_embedding_round_trips(storage: StorageEngine):
+    item = _insert_queue_item(storage, "doc")
+    with storage.conn:
+        chunk = _insert(storage, item.id, ordinal=0, title="chunk")
+        insert_embedding(storage, chunk.id, [0.1, 0.2, 0.3, 0.4])
+
+    row = storage.conn.execute(
+        "SELECT rowid FROM vec_chunks WHERE rowid = ?;", (chunk.id,)
+    ).fetchone()
+    assert row is not None
+    assert row["rowid"] == chunk.id
+
+
+def test_insert_embedding_noop_when_vec_unavailable(storage: StorageEngine, monkeypatch):
+    item = _insert_queue_item(storage, "doc")
+    monkeypatch.setattr(storage, "vec_available", False)
+    with storage.conn:
+        chunk = _insert(storage, item.id, ordinal=0, title="chunk")
+        insert_embedding(storage, chunk.id, [0.1, 0.2, 0.3, 0.4])  # must not raise

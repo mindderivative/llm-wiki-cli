@@ -322,9 +322,11 @@ doesn't need to mirror the `stager`/`ingest` package split internally):
 - **Non-text formats.** Deferred — confirmed as a later feature upgrade,
   not blocking initial `ingest`/`stager` build. Only plaintext/Markdown
   chunking is scoped for `atomize()` for now.
-- **Cascade write atomicity.** Note writes during `CASCADING` need to be
-  write-temp-then-rename (§5) — not yet verified against how `compiler`
-  will actually write files, since `compiler` isn't built yet.
+- ~~**Cascade write atomicity.**~~ **Resolved.** `compiler.write_source_note()`
+  (§11) writes `.tmp` then `Path.replace()`s into place. The *file* write
+  and the *DB* write are each atomic on their own but not atomic
+  *together* — a documented, deliberately-not-solved residual gap, see
+  §11's closing section.
 - ~~SIGINT handling mechanics~~ **Resolved.** `run --count AUTO` catches
   `KeyboardInterrupt` around the per-item loop and stops cleanly between
   items, reporting how many were attempted/completed. Turns out no
@@ -351,14 +353,13 @@ doesn't need to mirror the `stager`/`ingest` package split internally):
   item (files exist fine, only the hash-check/cleanup failed). These need
   different retry behavior and the row alone doesn't currently distinguish
   them cleanly. Scoped out rather than building a half-correct `retry`.
-- ~~**The pool keeps re-offering items with no next step.**~~ **Partially
-  resolved.** `PARSED` items no longer stall — `compile()` (item 4a,
-  this session) genuinely moves them to `ANALYZED`. The same shape of
-  gap now applies one step further down: `ANALYZED` is non-terminal, so
-  `list_pool()` keeps re-offering `ANALYZED` items until `cascade()`
-  (item 4b) exists to move them past it. Same "harmless, expected,
-  visible as a no-further-step row" behavior, just shifted forward one
-  status.
+- ~~**The pool keeps re-offering items with no next step.**~~ **Resolved.**
+  `compile()` (item 4a) moves `PARSED` → `ANALYZED`; `cascade()` (item
+  4b, source notes only) moves `ANALYZED` all the way to `COMPLETED` —
+  genuinely terminal, so the pool no longer re-offers a completed item.
+  Entity/concept note fan-out isn't built yet, but that doesn't reopen
+  this gap: it's LLM-driven post-processing on an already-`COMPLETED`
+  item, not a queue status of its own.
 - ~~`vcs.GitEngine` doesn't exist~~ **Resolved.** `init()` + `commit()`
   built, wired into `run`'s batch-end commit. **Follow-on gap, left
   open on purpose**: `VaultManager.create()` does not call
@@ -367,15 +368,12 @@ doesn't need to mirror the `stager`/`ingest` package split internally):
   `.git` until something actually completes a full ingest run. Revisit
   if this proves confusing; not addressed now since it's outside item
   5's stated scope ("wired into `run`'s batch-end commit").
-- **`run`'s commit wiring is built and tested, but still can't fire for
-  real.** `compile()` (item 4a) is real now, but nothing reaches
-  `COMPLETED` yet — the pipeline goes as far as `ANALYZED` and stops
-  there until `cascade()` (item 4b) exists. So in practice, every `run`
-  today prints "no items reached COMPLETED" and commits nothing; the
-  wiring itself is verified in `tests/test_cli_ingest.py` by
-  monkeypatching a stand-in for the still-not-built `cascade()` step
-  (`with_fake_cascade_step`). Expected, not a defect — will start
-  committing for real the moment item 4b ships.
+- ~~**`run`'s commit wiring is built and tested, but still can't fire for
+  real.**~~ **Resolved.** `cascade()` (item 4b) is real now — items reach
+  genuine `COMPLETED`, so `run`'s batch-end `vcs` commit fires for real
+  and is exercised end-to-end (not a monkeypatched stand-in) by
+  `tests/test_cli_ingest.py::test_run_commits_completed_items` and
+  friends.
 - **Real LLM calls need a reachable `llama-server` — there isn't one in
   this sandbox.** `LlamaClient`'s own tests use a `MagicMock(spec=
   openai.OpenAI)` (see §10), so they don't need one. But any real
@@ -486,13 +484,27 @@ doesn't need to mirror the `stager`/`ingest` package split internally):
      a fake `LlmClient` (`with_fake_llm_client`, monkeypatches
      `cli.LlamaClient`) so the item can reach the new real frontier,
      `ANALYZED`.
-   - **4b, `cascade()` (`ANALYZED`→`COMPLETED`)** — still deliberately
-     deferred to its own session, per §10's reasoning (the riskier,
-     more novel piece: how much an LLM is trusted to touch existing
-     `wiki/` notes). Append-only merge decision already locked in (§10)
-     so it doesn't need relitigating when this starts. Cascade note
-     writes still need to be atomic (write-temp-then-rename) from the
-     start, per §5's dependency on that.
+   - ~~**4b, `cascade()` (`ANALYZED`→`COMPLETED`)**~~ — **done, source
+     notes only** (§11). New `compiler` package (`write_source_note()`)
+     + `storage/notes_repo.py` + `chunk_repo.insert_embedding()`.
+     `cascade()` writes one `wiki/sources/{slug}.md` note per compiled
+     item (frontmatter + summary + source pointer), embeds it, and goes
+     straight to `COMPLETED` (no separate durable `CASCADED` resting
+     state — see §11's reasoning). Entity/concept note fan-out — the
+     actual "cascade" half, append-only merge per §10 — is **not**
+     built yet; deferred to its own session, same incremental slicing as
+     splitting `compile()`/`cascade()` apart in the first place.
+     `build_pipeline()` now also takes `vault_root` and only binds
+     `cascade()` in when both `llm_client` and `vault_root` are given.
+     `cli.py`'s `_dispatch_table()` passes both unconditionally — a
+     `LlamaClient` construction is cheap (no network call), so `run`/
+     `step` now genuinely drive items all the way to `COMPLETED` and
+     `run`'s batch-end `vcs` commit (item 5) is exercisable end-to-end
+     for the first time. 26 new tests (5 `textutil.slugify()`, 3
+     `notes_repo`, 2 `chunk_repo.insert_embedding()`, 6
+     `compiler.write_source_note()`, 7 `cascade()`, plus CLI test
+     updates for the new real `COMPLETED`/`Committed` frontier) —
+     142/142 total.
 5. ~~`vcs.GitEngine` minimal commit support, wired into `run`'s
    batch-end commit~~ — **done**, `src/llm_wiki/vcs/engine.py`, 9 tests,
    all passing. `init()` (idempotent — opens or creates the repo +
@@ -636,3 +648,127 @@ keeps working exactly as before, and only callers that actually have an
 This preserves the dispatcher's whole point (§4: no interface hardcodes
 "what runs next") while accommodating real dependency injection instead
 of a global/singleton `LlamaClient`.
+
+## 11. `cascade()` design (step 5) — source notes only, this session
+
+Item 4b covers two real things: **(a)** always write a source note for
+the compiled item (one per item, straightforward), and **(b)** fan out
+to create/update entity/concept notes for everything `compile()`
+extracted (the actual "cascade" — the append-only merge decided in §10).
+**Decided (user confirmed): this session builds (a) only.** (b) is its
+own session, same incremental pattern as splitting `compile()`
+(§10) out from `cascade()` in the first place. Entity/concept notes
+stay pure `queue_analysis` metadata for now — nothing in `wiki/`
+references them yet.
+
+**Decided (user confirmed): first-cut entity/concept notes (whenever
+(b) is built) will be a minimal stub** — frontmatter + a running
+"Mentioned in" list, no extra LLM call per entity. Locked in now even
+though (b) isn't built this session, so it doesn't need relitigating
+later (same reasoning as locking in the append-only decision in §10
+before `cascade()` existed at all).
+
+### New package: `compiler`
+
+ARCHITECTURE.md §7 already reserved `compiler` for "summarize → extract
+→ cascade-update → embed" — `compile()` ended up implemented directly in
+`ingest/compile.py` instead (calling `llm.LlamaClient` directly, no
+intermediate package), which was the right call for step 4 since there
+was nothing package-worthy to factor out. Note-writing is different:
+slug generation, frontmatter, atomic write-temp-then-rename, and
+chunk/embedding bookkeeping are genuinely reusable logic — not
+`ingest`-specific, and a real second consumer (`ingest.cascade()` calling
+it) exists from day one, same "centralize once a second real consumer
+shows up" reasoning that moved `queue`-row (de)serialization into
+`storage` back in §9 item 2. `src/llm_wiki/compiler/notes.py`:
+`write_source_note(item, analysis, vault_root, storage, llm_client) ->
+Note`. `ingest.cascade()` owns the state-machine transition; `compiler`
+owns turning `queue_analysis` output into an actual `wiki/` file +
+`notes`/`chunks`/`vec_chunks` rows.
+
+### What `write_source_note()` actually does
+
+1. Slug from `item.title` via a newly-shared `slugify()` (see below).
+   Checked against both the `notes` table (`get_note_row_by_slug`) *and*
+   the filesystem path — if either already exists, suffix `-2`, `-3`,
+   ... until free, same `_unique_path`-style collision handling
+   `stager.stage()` already uses for staged filenames. Necessary because
+   `item.title` (a bare filename stem, no date prefix) can collide
+   across two unrelated ingests — e.g. two different `meeting-notes.txt`
+   files staged on different days. A collision here means "two distinct
+   sources happen to share a name," not "the same source twice" — so it
+   always creates a new, distinct note rather than merging or
+   overwriting.
+2. Builds the file via `python-frontmatter` (verified its actual API in
+   the sandbox before writing code, same discipline as verifying
+   `outlines` before §10): frontmatter `type=source`, `title=item.title`,
+   `tags=[]`, `sources=[item.title]`; body is `queue_analysis.summary`
+   plus a short "## Source" section noting the archived original's path
+   and ingest timestamp. **Deliberately excludes entities/concepts** —
+   inventing a linking format (`[[wikilink]]`s to notes that don't exist
+   yet) before (b) is designed felt premature; they stay in
+   `queue_analysis` until the entity/concept session actually needs them.
+3. Writes to `wiki/sources/{slug}.md.tmp` then `Path.replace()`s it into
+   place — atomic rename, satisfying §5's write-temp-then-rename
+   requirement for cascade note writes.
+4. Inserts the `notes` row. `content_hash` is a sha256 of the exact
+   written file text (frontmatter + body) — mirrors `content_hash`'s
+   stated purpose (ARCHITECTURE.md §6: re-parse only if this changed).
+5. **One chunk for the whole note** (`note_id` set, `queue_item_id=NULL`
+   — the CHECK constraint already enforces exactly one). Deliberately
+   simple: a source note's body *is* the summary, a single short
+   paragraph — chunking it further would be manufacturing structure that
+   isn't there, not the "simplest chunker that's actually correct"
+   philosophy `atomize()` already established for step 3.
+6. Embeds that one chunk via `llm_client.embed()` and writes it into
+   `vec_chunks`. Verified the actual `sqlite-vec` insert mechanics in the
+   sandbox first: `sqlite_vec.serialize_float32(vector) -> bytes`, then
+   `INSERT INTO vec_chunks(rowid, embedding) VALUES (?, ?)` with `rowid`
+   matching `chunks.id` (confirmed against a real `StorageEngine`, not
+   assumed from docs).
+
+### `slugify()` extracted to a shared home
+
+`stager.stage()` already had private slugify logic for staged filenames;
+`compiler.write_source_note()` needs the identical thing for note slugs.
+Moved to `src/llm_wiki/textutil.py` (`slugify()`), `stager/stager.py`
+updated to import it instead of keeping its own private copy — same
+"centralize once a second real consumer exists" call as `queue_repo`.
+
+### `cascade()` itself, and folding `CASCADED` into `COMPLETED`
+
+`src/llm_wiki/ingest/cascade.py`: `cascade(item, storage, llm_client,
+vault_root)`. Same two-phase shape as `atomize()`/`compile()`: durable
+`CASCADING` marker commits first (crash-retry accepts `ANALYZED` or
+`CASCADING`), then the real work.
+
+**Decision, not previously settled**: `cascade()`'s terminal write is
+`status=COMPLETED` directly — there is no separate durable `CASCADED`
+row-state in practice. The state table (§3) describes `CASCADED` as
+"note writes + embeddings committed, terminal success for step 5," which
+reads as if it should be its own resting status before a further trivial
+flip to `COMPLETED` — but there is no real work between them (nothing
+consumes "note written, not yet marked complete" as a distinct state),
+so making it a genuine separate commit would just be overhead with no
+observable benefit, unlike `PARSING`→`PARSED` or `ANALYZING`→`ANALYZED`
+where real committed output actually changes between the two. The
+`CASCADED` enum value stays defined (schema/enum completeness, and in
+case a future split — e.g. "write note" and "embed" as two separately
+committed phases — gives it a real use) but nothing currently persists
+it as a resting status.
+
+### Known gap, not solved this session: note file + DB write isn't atomic together
+
+The `.tmp`-then-`replace()` rename makes the *file write* atomic, and
+`with storage.conn:` makes the *DB write* atomic — but the two aren't
+one atomic operation *together*. If the process crashes after the file
+lands but before the DB transaction commits, a retry (found at
+`CASCADING`) redoes `write_source_note()` from scratch — the collision
+check (step 1 above) means this creates a *new*, differently-slugged
+file rather than colliding with or corrupting the orphaned one, so nothing
+gets corrupted — but the orphaned first file is real, harmless disk
+litter, not automatically cleaned up. `stager.verify_and_clean()` solved
+the equivalent problem on the staging side (§2.1); building the
+equivalent for `cascade()` felt like scope creep for a first cut and
+is called out here explicitly rather than silently ignored — revisit if
+it proves to matter in practice.

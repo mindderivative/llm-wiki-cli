@@ -6,8 +6,9 @@ fully rebuildable via `StorageEngine.rebuild()`.
 """
 
 from llm_wiki.storage.analysis_repo import get_analysis_row, upsert_analysis_row
-from llm_wiki.storage.chunk_repo import insert_chunk_row, list_chunks_for_queue_item
+from llm_wiki.storage.chunk_repo import insert_chunk_row, insert_embedding, list_chunks_for_queue_item
 from llm_wiki.storage.engine import DEFAULT_EMBEDDING_DIM, StorageEngine
+from llm_wiki.storage.notes_repo import get_note_row_by_slug, insert_note_row
 from llm_wiki.storage.queue_repo import (
     get_queue_row,
     insert_queue_row,
@@ -28,6 +29,9 @@ __all__ = [
     "list_pool",
     "insert_chunk_row",
     "list_chunks_for_queue_item",
+    "insert_embedding",
     "upsert_analysis_row",
     "get_analysis_row",
+    "insert_note_row",
+    "get_note_row_by_slug",
 ]
