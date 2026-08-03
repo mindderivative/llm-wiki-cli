@@ -57,21 +57,23 @@ before any interface (CLI/MCP/GUI). No cloud LLM SDKs — local
 
 ## What's built so far
 
-All under `src/llm_wiki/`, with tests in `tests/`. **36/36 tests passing**
+All under `src/llm_wiki/`, with tests in `tests/`. **48/48 tests passing**
 against the real `~/pyDev/venv` interpreter as of this session.
 
 | Module | File(s) | Status |
 |---|---|---|
-| Package scaffold | `pyproject.toml`, `src/llm_wiki/{vault,stager,ingest,llm,compiler,graph,lint,vcs,storage}/__init__.py` | Done — subpackages beyond `storage`/`vault`/`stager` are docstring-only stubs, not implemented |
+| Package scaffold | `pyproject.toml`, `src/llm_wiki/{vault,stager,ingest,llm,compiler,graph,lint,vcs,storage}/__init__.py` | Done — subpackages beyond `storage`/`vault`/`stager`/`ingest` are docstring-only stubs, not implemented |
 | `config` | `config.py` | Done — `LlamaServerConfig`, `VaultSettings` (load/save `.llm-wiki-config`, derived path properties) |
 | `models` | `models.py` | Done — `QueueItem` (10-value `QueueStatus`, `failed_at_step`, defaults to `STAGED`), `Note`, `Chunk`, `Link`, `LintFinding` (mirror §6 SQLite schema); typed exception hierarchy (`VaultNotFoundError`, `StorageError`, `IngestionError`, etc.); public `utcnow()` helper |
-| `storage` | `storage/schema.py`, `storage/engine.py` | Done — `StorageEngine`: connect/init_schema/rebuild/close, best-effort `sqlite-vec` loading (degrades gracefully if unavailable), FK + CHECK constraints on `chunks` verified against real SQLite. `queue` table has `failed_at_step`, schema version 2 |
+| `storage` | `storage/{schema,engine,queue_repo,chunk_repo}.py` | Done — `StorageEngine`: connect/init_schema/rebuild/close, best-effort `sqlite-vec` loading, FK + CHECK constraints verified against real SQLite. `queue` table has `failed_at_step`, schema version 2. `queue_repo`/`chunk_repo` (new this session): shared row (de)serialization for `stager`+`ingest` — no internal `.commit()`, callers wrap writes in `with storage.conn:` so multi-statement steps commit atomically |
 | `vault` | `vault/manager.py` | Done — `VaultManager`: create/load/validate vault trees, seeds `wiki/index.md`/`log.md`/`SCHEMA.md`, wires in `StorageEngine` on create, cross-vault recent-vaults list (path injectable for tests). `REQUIRED_DIRS` now includes `raw/.staged/` |
-| `stager` | `stager/{stager,cleanup,_repo}.py` | Done — `stage()`: copies (never moves/deletes) into `raw/.sources/` + `raw/.staged/`, records `STAGED`/`FAILED`. `verify_and_clean()`: hash-verifies the archive, deletes the now-redundant original from `raw/`'s top level, flips to `FAILED` on mismatch. Deliberately separate functions (SRP), **not composed by anything yet** — no CLI/watcher calls either. Step 1 of the pipeline only — see `INGEST_PLAN.md` §2.1. 10 tests |
-| CLI (vault only) | `cli.py`, `__main__.py` | Done, manually smoke-tested, **no automated tests yet** — thin `typer` wrapper exposing `vault create/info/validate/list-recent/forget`. Run via `python -m llm_wiki ...`; not a `[project.scripts]` entry point (see gotcha below). **No `ingest`/`stager` CLI commands yet** — `stage()` only has direct Python-API test coverage so far |
+| `stager` | `stager/{stager,cleanup}.py` | Done — `stage()`: copies (never moves/deletes) into `raw/.sources/` + `raw/.staged/`, records `STAGED`/`FAILED`. `verify_and_clean()`: hash-verifies the archive, deletes the now-redundant original from `raw/`'s top level, flips to `FAILED` on mismatch. Deliberately separate functions (SRP), **not composed by anything yet** — no CLI/watcher calls either. Step 1 of the pipeline only — see `INGEST_PLAN.md` §2.1. 10 tests |
+| `ingest` | `ingest/{accept,atomize}.py` | **New this session** — `accept()` (step 2, `STAGED`→`QUEUED`, verifies both staged files are still readable). `atomize()` (step 3, `QUEUED`→`PARSING`→`PARSED`, plaintext/Markdown chunking via `markdown-it-py`'s block tokenizer — headings split chunks, `#` inside fenced code blocks correctly ignored). Non-text formats rejected as `FAILED` per the deferred-formats decision. 12 tests |
+| CLI (vault only) | `cli.py`, `__main__.py` | Done, manually smoke-tested, **no automated tests yet** — thin `typer` wrapper exposing `vault create/info/validate/list-recent/forget`. Run via `python -m llm_wiki ...`; not a `[project.scripts]` entry point (see gotcha below). **No `ingest`/`stager` CLI commands yet** — everything in those two packages only has direct Python-API test coverage so far, nothing chains `stage()`→`accept()`→`atomize()` together yet |
 
-Not started: `ingest` (steps 2–6), `llm`, `compiler`, `graph`, `lint`,
-`vcs`. No CLI commands exist yet for `stager`/`ingest` — only `vault`.
+Not started: `ingest` steps 4–6 (`compile()`, cascade-update, `COMPLETED`),
+`llm`, `compiler`, `graph`, `lint`, `vcs`. No CLI commands exist yet for
+`stager`/`ingest` — only `vault`.
 
 ## Key decisions made this session
 
@@ -214,13 +216,56 @@ watcher. **36/36 tests passing** (was 30, +6).
   external sources, no-op if already cleaned, no-op for a failed stage,
   hash-mismatch → FAILED, delete-failure → stays STAGED.
 
+## Session: ingest steps 2–3 — accept() + atomize()
+
+Picked up `INGEST_PLAN.md` §9 build order item 2. **48/48 tests passing**
+(was 36; +12 for `ingest`, net 0 for the refactor since it's a pure move).
+
+- `src/llm_wiki/ingest/accept.py` (new): `accept(item, storage)` — step 2,
+  `STAGED` → `QUEUED`. Confirms both files `stage()` produced (working
+  copy + archive) still exist and are readable before `ingest` takes
+  ownership. No `-ING` precursor (single fast check, not real work) —
+  same one-write shape as `stage()`. `FAILED`/`failed_at_step=QUEUED` on
+  a missing/unreadable file. No-ops if `item.status != STAGED`.
+- `src/llm_wiki/ingest/atomize.py` (new): `atomize(item, storage)` — step
+  3, `QUEUED` → `PARSING` → `PARSED`. Chunks `item.raw_path` into the
+  `chunks` table. Markdown splits on headings using `markdown-it-py`'s
+  **block tokenizer** (not a line regex) specifically so a `#` inside a
+  fenced code block is never mistaken for a heading — verified with a
+  dedicated test. Plaintext becomes one chunk. Unsupported extensions,
+  empty files, and invalid UTF-8 all fail cleanly
+  (`failed_at_step=PARSING`) rather than producing garbage chunks.
+  Two-phase status write per the atomicity contract: `PARSING` commits
+  alone before chunking starts; `PARSED` commits together with every
+  chunk it produced, one transaction, per `INGEST_PLAN.md` §3.
+- **Refactor forced by this** (done cleanly, not deferred): `ingest`
+  needed the exact same `queue`-row insert/update logic `stager` already
+  had. Rather than duplicate it a second time, moved it out of
+  `stager/_repo.py` into `storage/queue_repo.py` (+ new
+  `storage/chunk_repo.py` for chunk inserts) — `storage` already owns the
+  SQL layer per its own docstring, so this is centralizing, not adding a
+  new concern. Both repo modules dropped their internal `.commit()` —
+  callers now wrap writes in `with storage.conn:` (same pattern
+  `StorageEngine.init_schema()` already used). This is *why* `atomize()`
+  can commit its chunk inserts and `PARSED` status in one transaction;
+  without it, a crash between "chunks written" and "status updated"
+  would've been possible despite the atomicity contract saying otherwise.
+  `stage()`/`verify_and_clean()`/`accept()` all updated to the same
+  `with storage.conn:` pattern for consistency, even though their
+  single-row writes didn't strictly need it. All 10 existing `stager`
+  tests still pass unchanged after the refactor.
+- `tests/test_ingest_accept.py` (4 tests), `tests/test_ingest_atomize.py`
+  (8 tests, including the code-fence heading edge case).
+- `wiki-cli vault create`/`validate` re-smoke-tested — still clean.
+
 ## Suggested next step
 
-`ingest` steps 2–3 per `INGEST_PLAN.md` §9 build order item 2: accept a
-`STAGED` item (`QUEUED`), then `atomize()` into the `chunks` table
-(`PARSING` → `PARSED`), plaintext/Markdown only. Still no `llm` dependency
-— fully testable with `tmp_path` fixtures and mocked/trivial chunking.
-After that, `wiki-cli ingest add/list/status/step/run` (§9 item 3) to
-prove the pool + `--count`/`--status` state machine end-to-end before any
-LLM-dependent steps exist — **and remember `add` needs to call both
-`stage()` and `verify_and_clean()`**, not just `stage()`.
+Per `INGEST_PLAN.md` §9 item 3: `wiki-cli ingest add/list/status/step/run`,
+including the pool + `--count`/`--status` batch selection (§4, §5). This
+is where `stage()` → `verify_and_clean()` → `accept()` → `atomize()`
+finally get composed into an actual chain for the first time — until now
+each has only been called directly, in isolation, by tests. Also the
+first place a generic `step(id)`/`advance(id)` dispatcher (§4) needs to
+exist, since nothing has needed to look up "what's the next pending step
+for this item" yet. `ingest` steps 4–5 (`compile()`/cascade, needs `llm`)
+stay blocked until `llm` exists — not this next step.

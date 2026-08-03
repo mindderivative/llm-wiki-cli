@@ -23,8 +23,7 @@ from pathlib import Path
 from loguru import logger
 
 from llm_wiki.models import IngestionError, QueueItem, QueueStatus, utcnow
-from llm_wiki.stager._repo import insert_queue_row
-from llm_wiki.storage import StorageEngine
+from llm_wiki.storage import StorageEngine, insert_queue_row
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
@@ -72,7 +71,8 @@ def stage(source_path: Path, vault_root: Path, storage: StorageEngine) -> QueueI
             error=str(exc),
             failed_at_step=QueueStatus.STAGED,
         )
-        return insert_queue_row(storage, item)
+        with storage.conn:
+            return insert_queue_row(storage, item)
 
     logger.info(f"Staged {source_path} -> {staged_path} (archived: {archive_path})")
     item = QueueItem(
@@ -81,7 +81,8 @@ def stage(source_path: Path, vault_root: Path, storage: StorageEngine) -> QueueI
         archive_path=archive_path,
         status=QueueStatus.STAGED,
     )
-    return insert_queue_row(storage, item)
+    with storage.conn:
+        return insert_queue_row(storage, item)
 
 
 def _slugify(text: str) -> str:

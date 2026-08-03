@@ -1,16 +1,22 @@
 """`QueueItem` <-> `queue` row (de)serialization.
 
-Internal to `stager` — shared by `stager.stage()` (insert) and
-`stager.cleanup.verify_and_clean()` (update), so both functions stay
-single-purpose (copy a file; verify+clean a file) without duplicating
-row (de)serialization between them. Not part of the public `stager` API;
-import from `llm_wiki.stager`, not this module.
+Centralized here — not duplicated per-package — because both `stager`
+(`STAGED`/`FAILED`) and `ingest` (`QUEUED` onward) read and write the
+same `queue` table, via the same `StorageEngine` connection.
+
+Nothing in this module calls `.commit()`. Callers own the transaction
+boundary: wrap a call (or several) in `with storage.conn:` — the same
+pattern `StorageEngine.init_schema()` already uses — so that a
+multi-statement step (e.g. `ingest.atomize()`'s chunk inserts + its
+terminal status write) commits atomically, per INGEST_PLAN.md §3's
+atomicity contract. A single call outside any `with` block still works,
+but won't be durable until something commits it.
 """
 
 from __future__ import annotations
 
 from llm_wiki.models import QueueItem
-from llm_wiki.storage import StorageEngine
+from llm_wiki.storage.engine import StorageEngine
 
 _COLUMNS = (
     "title",
@@ -44,7 +50,6 @@ def insert_queue_row(storage: StorageEngine, item: QueueItem) -> QueueItem:
         f"INSERT INTO queue ({', '.join(_COLUMNS)}) VALUES ({placeholders});",
         _params(item),
     )
-    storage.conn.commit()
     return item.model_copy(update={"id": cursor.lastrowid})
 
 
@@ -57,5 +62,4 @@ def update_queue_row(storage: StorageEngine, item: QueueItem) -> QueueItem:
         f"UPDATE queue SET {set_clause} WHERE id = ?;",
         (*_params(item), item.id),
     )
-    storage.conn.commit()
     return item

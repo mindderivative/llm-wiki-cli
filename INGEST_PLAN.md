@@ -356,16 +356,35 @@ doesn't need to mirror the `stager`/`ingest` package split internally):
 5. ~~`src/llm_wiki/stager/` — new package~~ — **done**: `stage()` +
    `verify_and_clean()` (§2.1), both step-1-only (`STAGED`/`FAILED`,
    nothing past that). Nothing calls `verify_and_clean()` yet — see §7.
+6. ~~`src/llm_wiki/ingest/accept.py` + `atomize.py`~~ — **done**, see §9
+   item 2. `storage/queue_repo.py` + `storage/chunk_repo.py` are the new
+   shared repo modules both `stager` and `ingest` depend on.
 
 ## 9. Suggested build order
 
 1. ~~`stager.stage()` + `stager.verify_and_clean()`~~ — **done**,
-   `src/llm_wiki/stager/{stager,cleanup,_repo}.py`, 10 tests, all
-   passing. `stage()` always copies, never moves/deletes; cleanup is the
-   separate function that verifies-then-removes (§2.1). Not yet composed
-   by anything — see §7.
-2. `ingest` steps 2–3 (`QUEUED` → `PARSING` → `PARSED`) — atomize
-   plaintext/Markdown only. Still no LLM dependency.
+   `src/llm_wiki/stager/{stager,cleanup}.py`, 10 tests, all passing.
+   `stage()` always copies, never moves/deletes; cleanup is the separate
+   function that verifies-then-removes (§2.1). Not yet composed by
+   anything — see §7. (Row (de)serialization moved out of
+   `stager/_repo.py` into `storage/queue_repo.py` — see item 2.)
+2. ~~`ingest` steps 2–3 (`QUEUED` → `PARSING` → `PARSED`)~~ — **done**,
+   `src/llm_wiki/ingest/{accept,atomize}.py`, 12 tests, all passing.
+   `atomize()` uses `markdown-it-py`'s block tokenizer to split on
+   headings (correctly ignores `#` inside fenced code blocks) — plaintext
+   files become a single chunk. Non-text formats rejected with a clear
+   `FAILED` error, per §7's deferred-formats decision.
+   **Refactor along the way**: `queue`-row (de)serialization moved out of
+   `stager` into `storage/queue_repo.py` (+ new `storage/chunk_repo.py`),
+   since `ingest` needed the exact same insert/update logic `stager`
+   already had — centralizing it in `storage` (which already owns the
+   SQL layer per its own charter) avoids duplicating it a second time.
+   Both repo modules dropped their internal `.commit()` calls — callers
+   now wrap writes in `with storage.conn:`, required for `atomize()`'s
+   chunk-inserts-plus-status-write to commit as one transaction per the
+   atomicity contract (§3). `stage()`/`verify_and_clean()`/`accept()`
+   updated to the same pattern for consistency, even though their
+   single-row writes didn't strictly require it.
 3. `wiki-cli ingest add/list/status/step/run`, including the pool +
    `--count`/`--status` batch selection (§4, §5), against the above (no
    commit yet) — proves the state machine and resumability contract

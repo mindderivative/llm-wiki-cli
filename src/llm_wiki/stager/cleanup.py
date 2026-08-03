@@ -30,8 +30,7 @@ from pathlib import Path
 from loguru import logger
 
 from llm_wiki.models import IngestionError, QueueItem, QueueStatus, utcnow
-from llm_wiki.stager._repo import update_queue_row
-from llm_wiki.storage import StorageEngine
+from llm_wiki.storage import StorageEngine, update_queue_row
 
 _HASH_CHUNK_SIZE = 1024 * 1024
 
@@ -84,7 +83,8 @@ def verify_and_clean(
                 "updated_at": utcnow(),
             }
         )
-        return update_queue_row(storage, failed)
+        with storage.conn:
+            return update_queue_row(storage, failed)
 
     try:
         original_path.unlink()
@@ -95,7 +95,8 @@ def verify_and_clean(
         logger.warning(f"Verified {original_path} but could not remove it: {exc}")
 
     verified = item.model_copy(update={"updated_at": utcnow()})
-    return update_queue_row(storage, verified)
+    with storage.conn:
+        return update_queue_row(storage, verified)
 
 
 def _sha256(path: Path) -> str:
