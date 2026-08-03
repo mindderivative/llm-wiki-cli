@@ -29,7 +29,7 @@ class LlamaServerConfig(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="LLM_WIKI_LLAMA_")
 
-    base_url: str = Field(default="http://localhost:8080/v1")
+    base_url: str = Field(default="http://127.0.0.1:11434/v1")
     api_key: str = Field(
         default="not-needed",
         description="llama-server ignores this; required by the OpenAI client's request shape.",
