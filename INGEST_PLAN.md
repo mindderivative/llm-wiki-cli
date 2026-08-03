@@ -307,15 +307,15 @@ doesn't need to mirror the `stager`/`ingest` package split internally):
 
 | Command | Behavior |
 |---|---|
-| `ingest add <path...>` | Entry point B — stage each path only. No run, no commit. |
-| `ingest list [--status STAGED\|FAILED\|...]` | List queue items, optionally filtered by status. Primary "what's the state of everything" view after a reboot. |
-| `ingest status <id>` | Full detail for one item — status, error, `failed_at_step`, raw_path, archive_path, timestamps. |
-| `ingest step <id>` | Run exactly the next pending step for one item. No commit. |
-| `ingest step --count N [--status STATUS]` | Single-step batch (§4) — advance up to N pool items by one step each, then stop. No commit. |
-| `ingest run --count N\|AUTO` | Pool-driven, full-completion batch run (§5), one commit at the end. `AUTO` drains the whole pool, no manual gating. |
-| `ingest run <id...>` | Explicit-id, full-completion batch run (§5), one commit at the end. |
-| `ingest retry <id>` | Reset a `FAILED` item to its last good status, clear `failed_at_step`/`error`. Does not itself run or commit — the item goes back into the pool for the next batch run, or can be targeted directly by id. Never automatic. |
-| `ingest watch` | Foreground `stager` watcher process (or driven by `auto_watch_raw` config, TBD which). Stages only — does not run or commit (§5). |
+| `ingest add <path...>` | **Built.** Entry point B — stages each path (`stage()` → `verify_and_clean()`, composed for the first time). No run, no commit. |
+| `ingest list [--status STAGED\|FAILED\|...]` | **Built.** List queue items, optionally filtered by status. Primary "what's the state of everything" view after a reboot. |
+| `ingest status <id>` | **Built.** Full detail for one item — status, error, `failed_at_step`, raw_path, archive_path, timestamps. |
+| `ingest step <id>` | **Built.** Run exactly the next pending step for one item. No commit. |
+| `ingest step --count N [--status STATUS]` | **Built.** Single-step batch (§4) — advance up to N pool items by one step each, then stop. No commit. |
+| `ingest run --count N\|AUTO` | **Built**, minus the commit. Pool-driven, full-completion batch run (§5). `AUTO` drains the whole pool, interruptible via Ctrl-C. **No commit performed** — `vcs` doesn't exist yet (§9 build order item 5 is still ahead); the command says so explicitly in its own output. |
+| `ingest run <id...>` | **Built**, same no-commit caveat. Explicit-id, full-completion batch run (§5). |
+| `ingest retry <id>` | **Deferred, not built.** Not literally named in §9 build order item 3's text (only "add/list/status/step/run" is) — see the new open item below for why this isn't a trivial add. |
+| `ingest watch` | **Deferred, not built** — §9 build order item 6, needs the actual `watchdog` integration. |
 
 ## 7. Known gaps / open decisions
 
@@ -325,19 +325,40 @@ doesn't need to mirror the `stager`/`ingest` package split internally):
 - **Cascade write atomicity.** Note writes during `CASCADING` need to be
   write-temp-then-rename (§5) — not yet verified against how `compiler`
   will actually write files, since `compiler` isn't built yet.
-- **SIGINT handling mechanics.** §5 describes the intended pause
-  behavior for `--count AUTO`; the actual signal-handling implementation
-  (where the interrupt is checked, how "finish current step" is
-  guaranteed) is a real implementation detail still to work out when
-  `run` gets built, not just a config flag.
+- ~~SIGINT handling mechanics~~ **Resolved.** `run --count AUTO` catches
+  `KeyboardInterrupt` around the per-item loop and stops cleanly between
+  items, reporting how many were attempted/completed. Turns out no
+  special signal-masking was needed: `with storage.conn:` (sqlite3's
+  transaction context manager) already **rolls back** on any exception
+  raised inside it, including `KeyboardInterrupt` — so even an
+  interrupt landing mid-transaction is automatically safe, same
+  guarantee as the atomicity contract's crash-recovery convention (§3).
+  An *ungraceful* kill (not caught at all, e.g. `kill -9`) is equally
+  safe for the same reason, just without the clean summary message.
 - ~~Does the watcher's drop-zone self-clean?~~ **Resolved** — see §2.1,
   `verify_and_clean()`. `stage()` itself still never moves/deletes
   anything; cleanup is a deliberately separate function.
-- **Who calls `verify_and_clean()`?** It exists and is fully tested, but
-  nothing calls it yet — there's no CLI `ingest add` or watcher handler
-  to compose `stage()` → `verify_and_clean()` in sequence. Whoever builds
-  that orchestration (§9) must call both, in that order; `stage()`
-  succeeding alone leaves the original sitting in `raw/` uncleaned.
+- ~~Who calls `verify_and_clean()`?~~ **Resolved** — `ingest add` now
+  calls `stage()` then `verify_and_clean()`, in that order, for every
+  path given.
+- **`retry` is deferred, and not a trivial add.** `failed_at_step`
+  cleanly maps to "the status to reset to" for `QUEUED`→revert-to-`STAGED`
+  and `PARSING`→revert-to-`QUEUED` failures — but a `failed_at_step=STAGED`
+  failure is ambiguous: it could mean `stage()` itself failed (no files
+  were ever written, `archive_path` is `None` — the only real "retry" is
+  re-running `add` on the original path, not a status flip) *or* that
+  `verify_and_clean()` failed post-hoc on an already-successfully-staged
+  item (files exist fine, only the hash-check/cleanup failed). These need
+  different retry behavior and the row alone doesn't currently distinguish
+  them cleanly. Scoped out rather than building a half-correct `retry`.
+- **The pool keeps re-offering items with no next step.** Since `PARSED`
+  is non-terminal, `list_pool()` includes `PARSED` items in every future
+  `run`/`step --count` call until `compile()` exists to move them past
+  it — `run --count AUTO` run twice in a row will re-list and re-attempt
+  every already-`PARSED` item both times (harmlessly — `step_once()`
+  no-ops on them — but it's visible in the output as "no further step
+  implemented yet" rows). Expected given the current build state, not a
+  bug; will stop happening naturally once `compile()` ships.
 
 ## 8. Required changes before implementation starts
 
@@ -365,9 +386,9 @@ doesn't need to mirror the `stager`/`ingest` package split internally):
 1. ~~`stager.stage()` + `stager.verify_and_clean()`~~ — **done**,
    `src/llm_wiki/stager/{stager,cleanup}.py`, 10 tests, all passing.
    `stage()` always copies, never moves/deletes; cleanup is the separate
-   function that verifies-then-removes (§2.1). Not yet composed by
-   anything — see §7. (Row (de)serialization moved out of
-   `stager/_repo.py` into `storage/queue_repo.py` — see item 2.)
+   function that verifies-then-removes (§2.1). Composed together by
+   `wiki-cli ingest add` — see item 3. (Row (de)serialization moved out
+   of `stager/_repo.py` into `storage/queue_repo.py` — see item 2.)
 2. ~~`ingest` steps 2–3 (`QUEUED` → `PARSING` → `PARSED`)~~ — **done**,
    `src/llm_wiki/ingest/{accept,atomize}.py`, 12 tests, all passing.
    `atomize()` uses `markdown-it-py`'s block tokenizer to split on
@@ -385,12 +406,27 @@ doesn't need to mirror the `stager`/`ingest` package split internally):
    atomicity contract (§3). `stage()`/`verify_and_clean()`/`accept()`
    updated to the same pattern for consistency, even though their
    single-row writes didn't strictly require it.
-3. `wiki-cli ingest add/list/status/step/run`, including the pool +
-   `--count`/`--status` batch selection (§4, §5), against the above (no
-   commit yet) — proves the state machine and resumability contract
-   end-to-end before the LLM steps or `vcs` exist. This is also where
-   `stage()` → `verify_and_clean()` finally get composed (§7) — `add`
-   should call both.
+3. ~~`wiki-cli ingest add/list/status/step/run`~~ — **done**, all in
+   `cli.py`'s new `ingest_app`. Pool + `--count`/`--status` batch
+   selection (§4, §5) built as designed: `step` (single id or
+   `--count`/`--status` batch, never commits) and `run` (explicit ids or
+   `--count N|AUTO`, stops on the first `FAILED`, `--count AUTO`
+   interruptible via Ctrl-C — see §7 for why that turned out to need no
+   special handling). **No commit performed** — `run`'s own output says
+   so explicitly, since `vcs` doesn't exist yet (item 5 below). `add`
+   composes `stage()` → `verify_and_clean()` for the first time. New
+   generic dispatcher, `ingest/pipeline.py`'s `step_once()`/`advance()`,
+   is what makes `step`/`run` interface-agnostic — the CLI doesn't know
+   which concrete function handles which status. 30 new tests (6
+   dispatcher, 14 CLI via `typer.testing.CliRunner`, 8 `queue_repo` read
+   functions, 1 `atomize()` PARSING-retry regression) — 77/77 total.
+   **Found and fixed along the way**: `atomize()`'s no-op guard only
+   accepted `QUEUED`, which would have silently broken the crash-recovery
+   convention for anything found parked at `PARSING` — now accepts both.
+   `retry` and `watch` intentionally not built this pass — not literally
+   named in this build-order item's original text, and `retry` in
+   particular has a real design gap around `failed_at_step=STAGED`
+   (see §7) worth resolving deliberately rather than rushing.
 4. `ingest` steps 4–5 (`ANALYZING`/`CASCADING`) — depends on `llm`
    (not started). Mocked LLM client for tests per ARCHITECTURE.md §11.
    Cascade note writes built atomic (write-temp-then-rename) from the

@@ -164,6 +164,19 @@ def test_atomize_invalid_utf8_fails(vault_root: Path, storage: StorageEngine):
     assert result.failed_at_step == QueueStatus.PARSING
 
 
+def test_atomize_retries_from_parking_status(vault_root: Path, storage: StorageEngine):
+    # Simulates a crash that left the row parked at PARSING — nothing
+    # committed for it yet, so atomize() must be able to redo it from
+    # scratch (INGEST_PLAN.md §3's recovery convention), not just QUEUED.
+    item = _queued_item(vault_root, storage, "notes.txt", "content")
+    parked = item.model_copy(update={"status": QueueStatus.PARSING})
+
+    result = atomize(parked, storage)
+
+    assert result.status == QueueStatus.PARSED
+    assert len(_chunks_for(storage, result.id)) == 1
+
+
 def test_atomize_noop_for_non_queued_item(vault_root: Path, storage: StorageEngine):
     item = _queued_item(vault_root, storage, "notes.txt", "content")
     parsed = atomize(item, storage)

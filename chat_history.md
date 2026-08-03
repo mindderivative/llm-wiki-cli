@@ -57,7 +57,7 @@ before any interface (CLI/MCP/GUI). No cloud LLM SDKs — local
 
 ## What's built so far
 
-All under `src/llm_wiki/`, with tests in `tests/`. **48/48 tests passing**
+All under `src/llm_wiki/`, with tests in `tests/`. **77/77 tests passing**
 against the real `~/pyDev/venv` interpreter as of this session.
 
 | Module | File(s) | Status |
@@ -65,15 +65,14 @@ against the real `~/pyDev/venv` interpreter as of this session.
 | Package scaffold | `pyproject.toml`, `src/llm_wiki/{vault,stager,ingest,llm,compiler,graph,lint,vcs,storage}/__init__.py` | Done — subpackages beyond `storage`/`vault`/`stager`/`ingest` are docstring-only stubs, not implemented |
 | `config` | `config.py` | Done — `LlamaServerConfig`, `VaultSettings` (load/save `.llm-wiki-config`, derived path properties) |
 | `models` | `models.py` | Done — `QueueItem` (10-value `QueueStatus`, `failed_at_step`, defaults to `STAGED`), `Note`, `Chunk`, `Link`, `LintFinding` (mirror §6 SQLite schema); typed exception hierarchy (`VaultNotFoundError`, `StorageError`, `IngestionError`, etc.); public `utcnow()` helper |
-| `storage` | `storage/{schema,engine,queue_repo,chunk_repo}.py` | Done — `StorageEngine`: connect/init_schema/rebuild/close, best-effort `sqlite-vec` loading, FK + CHECK constraints verified against real SQLite. `queue` table has `failed_at_step`, schema version 2. `queue_repo`/`chunk_repo` (new this session): shared row (de)serialization for `stager`+`ingest` — no internal `.commit()`, callers wrap writes in `with storage.conn:` so multi-statement steps commit atomically |
+| `storage` | `storage/{schema,engine,queue_repo,chunk_repo}.py` | Done — `StorageEngine`: connect/init_schema/rebuild/close, best-effort `sqlite-vec` loading, FK + CHECK constraints verified against real SQLite. `queue` table has `failed_at_step`, schema version 2. `queue_repo`/`chunk_repo`: shared row (de)serialization for `stager`+`ingest`, no internal `.commit()` (callers wrap writes in `with storage.conn:`). `queue_repo` now also has `get_queue_row`/`list_queue_rows`/`list_pool` (new this session — the pool query is `list_pool()`: non-terminal items, oldest first, optional status filter) |
 | `vault` | `vault/manager.py` | Done — `VaultManager`: create/load/validate vault trees, seeds `wiki/index.md`/`log.md`/`SCHEMA.md`, wires in `StorageEngine` on create, cross-vault recent-vaults list (path injectable for tests). `REQUIRED_DIRS` now includes `raw/.staged/` |
-| `stager` | `stager/{stager,cleanup}.py` | Done — `stage()`: copies (never moves/deletes) into `raw/.sources/` + `raw/.staged/`, records `STAGED`/`FAILED`. `verify_and_clean()`: hash-verifies the archive, deletes the now-redundant original from `raw/`'s top level, flips to `FAILED` on mismatch. Deliberately separate functions (SRP), **not composed by anything yet** — no CLI/watcher calls either. Step 1 of the pipeline only — see `INGEST_PLAN.md` §2.1. 10 tests |
-| `ingest` | `ingest/{accept,atomize}.py` | **New this session** — `accept()` (step 2, `STAGED`→`QUEUED`, verifies both staged files are still readable). `atomize()` (step 3, `QUEUED`→`PARSING`→`PARSED`, plaintext/Markdown chunking via `markdown-it-py`'s block tokenizer — headings split chunks, `#` inside fenced code blocks correctly ignored). Non-text formats rejected as `FAILED` per the deferred-formats decision. 12 tests |
-| CLI (vault only) | `cli.py`, `__main__.py` | Done, manually smoke-tested, **no automated tests yet** — thin `typer` wrapper exposing `vault create/info/validate/list-recent/forget`. Run via `python -m llm_wiki ...`; not a `[project.scripts]` entry point (see gotcha below). **No `ingest`/`stager` CLI commands yet** — everything in those two packages only has direct Python-API test coverage so far, nothing chains `stage()`→`accept()`→`atomize()` together yet |
+| `stager` | `stager/{stager,cleanup}.py` | Done — `stage()`: copies (never moves/deletes) into `raw/.sources/` + `raw/.staged/`, records `STAGED`/`FAILED`. `verify_and_clean()`: hash-verifies the archive, deletes the now-redundant original from `raw/`'s top level, flips to `FAILED` on mismatch. Deliberately separate functions (SRP) — **now composed together for the first time**, by `wiki-cli ingest add` (see below). Step 1 of the pipeline only — see `INGEST_PLAN.md` §2.1. 10 tests |
+| `ingest` | `ingest/{accept,atomize,pipeline}.py` | `accept()` (step 2, `STAGED`→`QUEUED`). `atomize()` (step 3, `QUEUED`/`PARSING`→`PARSED`, plaintext/Markdown chunking via `markdown-it-py`'s block tokenizer — `#` inside fenced code blocks correctly ignored). `pipeline.py` (**new this session**): `step_once()`/`advance()`, the generic status→function dispatcher (INGEST_PLAN.md §4) — this is what lets the CLI drive the pipeline without knowing which concrete function handles which status. 18 tests (12 accept/atomize + 6 dispatcher) |
+| CLI | `cli.py`, `__main__.py` | `vault` group done (smoke-tested only, still no automated tests — flagged tech debt). **`ingest` group is new this session and fully tested**: `add` (stages + cleans, composing `stager` for the first time), `list`, `status`, `step` (single id or `--count`/`--status` pool batch), `run` (explicit ids or `--count N\|AUTO`, stops on `FAILED`, `--count AUTO` interruptible via Ctrl-C). **`run` performs no commit yet** — says so in its own output; `vcs` isn't built. `retry`/`watch` deliberately not built this pass (see below). 14 CLI tests via `typer.testing.CliRunner` — first automated CLI coverage in the project. Run via `python -m llm_wiki ...`; not a `[project.scripts]` entry point (see gotcha below) |
 
 Not started: `ingest` steps 4–6 (`compile()`, cascade-update, `COMPLETED`),
-`llm`, `compiler`, `graph`, `lint`, `vcs`. No CLI commands exist yet for
-`stager`/`ingest` — only `vault`.
+`llm`, `compiler`, `graph`, `lint`, `vcs`, `ingest retry`/`watch`.
 
 ## Key decisions made this session
 
@@ -258,14 +257,94 @@ Picked up `INGEST_PLAN.md` §9 build order item 2. **48/48 tests passing**
   (8 tests, including the code-fence heading edge case).
 - `wiki-cli vault create`/`validate` re-smoke-tested — still clean.
 
+## Session: ingest pipeline dispatcher + wiki-cli ingest add/list/status/step/run
+
+Picked up `INGEST_PLAN.md` §9 build order item 3. **77/77 tests passing**
+(was 48; +29: 8 `queue_repo` read-path, 6 `pipeline`, 1 `atomize` retry
+regression, 14 CLI).
+
+- `src/llm_wiki/ingest/pipeline.py` (new): the generic step dispatcher —
+  a `status -> handler` table (`STAGED: accept, QUEUED: atomize,
+  PARSING: atomize`) plus `step_once(item, storage)` (look up and run
+  exactly one handler, no-op if none registered) and
+  `advance(item, storage)` (loop `step_once` until status stops
+  changing — i.e. terminal, or no handler registered). CLI/watcher never
+  need to hardcode "what comes next" — this table is the single place
+  that mapping lives, per §4.
+- **Bug found while wiring `PARSING` into the dispatcher**:
+  `atomize()`'s guard clause only accepted `item.status == QUEUED`, so a
+  crash-parked `PARSING` item (the atomicity contract's whole reason for
+  `-ING` statuses existing) would have silently no-op'd instead of being
+  retried from scratch. Widened to `(QUEUED, PARSING)`. Added
+  `test_atomize_retries_from_parking_status` as a regression test.
+- `storage/queue_repo.py`: added the read-path — `get_queue_row(storage,
+  item_id)`, `list_queue_rows(storage, *, status=None)`, and
+  `list_pool(storage, *, status=None, limit=None)` (excludes
+  `COMPLETED`/`FAILED`, ordered oldest-`created_at`-first). `list_pool`
+  is "the pool" from §4/§5 — the batch-selection source for `step
+  --count`/`run --count`.
+- `src/llm_wiki/cli.py`: new `ingest` sub-app —
+  - `add PATH` — runs `stage()` → `verify_and_clean()` → `accept()` in
+    sequence, the first place these get composed into an actual chain
+    instead of being called directly by tests.
+  - `list [--status]` — table over `list_queue_rows()`.
+  - `status ID` — full detail for one item; errors on missing id.
+  - `step (ID | --count N|AUTO) [--status]` — single-step batch: each
+    selected item advances by exactly **one** step via `step_once()`,
+    never commits past that. Validates exactly one of `ID`/`--count`.
+  - `run (ID... | --count N|AUTO)` — full-completion batch: each
+    selected item runs `advance()` to terminal status. Stops immediately
+    on the first `FAILED` (later items in the batch are left untouched,
+    not attempted) and exits 1. Wrapped in `try/except
+    KeyboardInterrupt` so an interrupted batch reports how much it got
+    through rather than crashing.
+  - **Discovery, not a build**: `sqlite3.Connection` used as `with
+    storage.conn:` already rolls back automatically on *any* exception,
+    including `KeyboardInterrupt`. So `run`'s interrupt handling needed
+    no custom signal masking — the existing atomicity pattern already
+    made batch interruption safe by construction. This resolves the
+    "SIGINT handling mechanics" gap that was open in `INGEST_PLAN.md` §7.
+  - `run` prints `"No commit performed"` at the end unconditionally —
+    `vcs.GitEngine` doesn't exist yet (§9 item 5), so batch-end commit is
+    a documented no-op for now, not silently skipped.
+- **Deliberately deferred, not built**: `ingest retry` and `ingest
+  watch`. Both are in `INGEST_PLAN.md` §6's CLI table but weren't named
+  in §9 item 3's text. `retry` specifically has a real open design gap:
+  a `FAILED` item with `failed_at_step=STAGED` could mean either "`stage()`
+  itself failed, nothing was ever written" or "`verify_and_clean()`
+  failed post-hoc on an already-good stage" — these need different retry
+  behavior and the row doesn't currently distinguish them. Documented in
+  §7 rather than building a half-correct version.
+- **Documented, not a bug**: `PARSED` items have nothing registered to
+  advance them past `PARSED` yet (no `compile()`), so they keep
+  reappearing in `list_pool()` results and show a "no further step
+  implemented yet" row on every future `run`/`step --count` call until
+  `compile()` exists. Noted in §7 so it isn't mistaken for a defect
+  later.
+- `tests/test_queue_repo.py` (8), `tests/test_ingest_pipeline.py` (6),
+  `tests/test_cli_ingest.py` (14, first automated CLI coverage in the
+  project, uses `typer.testing.CliRunner`). One test bug caught and
+  fixed during writing: asserted `"Stopped" in result.stdout`, but that
+  message goes through `err_console` (a `rich.Console(stderr=True)`) —
+  lands in `result.stderr`, a separate stream from `result.stdout` under
+  this typer/click version.
+- Manually smoke-tested end-to-end in the sandbox: `add`, `list`,
+  `status`, `step` (single id + `--count`/`--status` batch), `run
+  --count AUTO` draining the whole pool, `run` stopping correctly on a
+  `FAILED` item with exit code 1, `list --status FAILED` filter.
+
 ## Suggested next step
 
-Per `INGEST_PLAN.md` §9 item 3: `wiki-cli ingest add/list/status/step/run`,
-including the pool + `--count`/`--status` batch selection (§4, §5). This
-is where `stage()` → `verify_and_clean()` → `accept()` → `atomize()`
-finally get composed into an actual chain for the first time — until now
-each has only been called directly, in isolation, by tests. Also the
-first place a generic `step(id)`/`advance(id)` dispatcher (§4) needs to
-exist, since nothing has needed to look up "what's the next pending step
-for this item" yet. `ingest` steps 4–5 (`compile()`/cascade, needs `llm`)
-stay blocked until `llm` exists — not this next step.
+Per `INGEST_PLAN.md` §9, item 3 is now done. Two things remain to unblock
+before ingest is a complete pipeline:
+
+- **Item 5, `vcs.GitEngine` (minimal commit support)** — the more
+  self-contained of the two. `run`'s batch-end commit is currently a
+  documented no-op ("No commit performed"); this is what would make it
+  real. Doesn't depend on anything not already built.
+- **Item 4, `ingest` steps 4–5 (`compile()`/cascade)** — still blocked on
+  the `llm` package, which doesn't exist yet.
+
+`GitEngine` is the more natural next pickup since it has no blockers.
+`ingest retry`/`ingest watch` remain deferred per the design gaps noted
+in §7 above.

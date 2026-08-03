@@ -37,12 +37,15 @@ _md = MarkdownIt()
 def atomize(item: QueueItem, storage: StorageEngine) -> QueueItem:
     """Chunk `item.raw_path` into the `chunks` table.
 
-    No-ops (returns `item` unchanged) if `item.status != QUEUED`. Never
-    raises for atomize-domain failures (unsupported format, unreadable
-    file, invalid encoding, no content) — those come back as `FAILED`
+    Accepts `QUEUED` (normal start) or `PARSING` (found parked mid-step
+    after a crash — safe to redo from scratch, nothing was committed for
+    it yet, per INGEST_PLAN.md §3's atomicity/recovery convention).
+    No-ops (returns `item` unchanged) for any other status. Never raises
+    for atomize-domain failures (unsupported format, unreadable file,
+    invalid encoding, no content) — those come back as `FAILED`
     (`failed_at_step=PARSING`), per INGEST_PLAN.md's failure contract.
     """
-    if item.status != QueueStatus.QUEUED:
+    if item.status not in (QueueStatus.QUEUED, QueueStatus.PARSING):
         return item
 
     parsing = item.model_copy(update={"status": QueueStatus.PARSING, "updated_at": utcnow()})
