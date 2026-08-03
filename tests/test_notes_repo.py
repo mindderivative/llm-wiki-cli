@@ -3,7 +3,14 @@ from pathlib import Path
 import pytest
 
 from llm_wiki.models import Note, NoteType
-from llm_wiki.storage import StorageEngine, get_note_row_by_slug, insert_note_row, update_note_row
+from llm_wiki.storage import (
+    StorageEngine,
+    delete_note_row,
+    get_note_row_by_slug,
+    insert_note_row,
+    list_note_rows,
+    update_note_row,
+)
 
 
 @pytest.fixture
@@ -69,7 +76,7 @@ def test_update_note_row_persists_new_sources_and_hash(storage: StorageEngine):
     assert fetched.content_hash == "newhash"
 
 
-def test_update_note_row_does_not_change_slug_or_type(storage: StorageEngine):
+def test_update_note_row_leaves_slug_untouched(storage: StorageEngine):
     with storage.conn:
         inserted = insert_note_row(storage, _note())
 
@@ -80,3 +87,41 @@ def test_update_note_row_does_not_change_slug_or_type(storage: StorageEngine):
     fetched = get_note_row_by_slug(storage, "acme-corp")
     assert fetched.slug == "acme-corp"
     assert fetched.type == NoteType.SOURCE
+
+
+def test_update_note_row_can_change_type_and_title(storage: StorageEngine):
+    # Broadened for graph.rebuild_links() (GRAPH_LINT_PLAN.md §2), which
+    # reconciles a hand-edited note's frontmatter wholesale.
+    with storage.conn:
+        inserted = insert_note_row(storage, _note())
+
+    updated = inserted.model_copy(update={"type": NoteType.CONCEPT, "title": "Renamed"})
+    with storage.conn:
+        update_note_row(storage, updated)
+
+    fetched = get_note_row_by_slug(storage, "acme-corp")
+    assert fetched.type == NoteType.CONCEPT
+    assert fetched.title == "Renamed"
+
+
+def test_list_note_rows_returns_every_note(storage: StorageEngine):
+    with storage.conn:
+        insert_note_row(storage, _note(slug="a"))
+        insert_note_row(storage, _note(slug="b"))
+
+    slugs = {note.slug for note in list_note_rows(storage)}
+    assert slugs == {"a", "b"}
+
+
+def test_list_note_rows_empty_when_no_notes(storage: StorageEngine):
+    assert list_note_rows(storage) == []
+
+
+def test_delete_note_row_removes_it(storage: StorageEngine):
+    with storage.conn:
+        inserted = insert_note_row(storage, _note())
+
+    with storage.conn:
+        delete_note_row(storage, inserted.id)
+
+    assert get_note_row_by_slug(storage, "acme-corp") is None

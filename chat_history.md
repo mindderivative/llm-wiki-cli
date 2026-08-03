@@ -57,8 +57,12 @@ before any interface (CLI/MCP/GUI). No cloud LLM SDKs — local
 
 ## What's built so far
 
-All under `src/llm_wiki/`, with tests in `tests/`. **153/153 tests passing**
+All under `src/llm_wiki/`, with tests in `tests/`. **197/197 tests passing**
 against the real `~/pyDev/venv` interpreter as of this session.
+
+`graph`/`lint` (new this session — see `GRAPH_LINT_PLAN.md`): `graph.rebuild_links(vault_root, storage, *, full=False)` walks `wiki/`, reconciles the `notes` table against actual files (discovers hand-authored notes, detects hand-edits via `content_hash`, detects deletions), and maintains the `links` table from `[[wikilink]]`s. `lint.run(vault_root, storage)` reports `broken_link`/`isolated_note` (from the DB) and `schema_violation` (its own small filesystem walk) findings plus a health score, persisted per-run under a `run_id`. New CLI: `wiki-cli graph rebuild [--full]`, `wiki-cli lint run` — deliberately **not** auto-wired into `ingest run` (asked the user; kept separate for this first cut). New repo modules `storage/links_repo.py`, `storage/lint_repo.py`; `storage/notes_repo.py` gained `list_note_rows()`/`delete_note_row()` and `update_note_row()` was broadened to cover every mutable field. `textutil.py` gained `content_hash()` (moved out of `compiler`, now shared with `graph`).
+
+**Two real bugs found and fixed this session, both via manual end-to-end smoke testing, not caught by unit tests alone**: (1) `graph.rebuild_links()`'s writes weren't wrapped in `with storage.conn:`, so nothing actually persisted across a connection reopen — fixed, regression test added. (2) `content_hash` matching was wrongly treated as "links already extracted," since `compiler` sets that hash without ever touching `links` — a freshly-`cascade()`d note's links were silently never indexed on its first `graph rebuild`. Fixed: link extraction now always runs every file, every call; only the `notes` row write itself is hash-gated. Also fixed a latent bug in `ingest status`'s CLI output (`", ".join(analysis.entities)` broke once `entities` became `list[Mention]` in the prior session — never triggered because no test exercised it with real data).
 
 | Module | File(s) | Status |
 |---|---|---|

@@ -8,7 +8,20 @@ fully rebuildable via `StorageEngine.rebuild()`.
 from llm_wiki.storage.analysis_repo import get_analysis_row, upsert_analysis_row
 from llm_wiki.storage.chunk_repo import insert_chunk_row, insert_embedding, list_chunks_for_queue_item
 from llm_wiki.storage.engine import DEFAULT_EMBEDDING_DIM, StorageEngine
-from llm_wiki.storage.notes_repo import get_note_row_by_slug, insert_note_row, update_note_row
+from llm_wiki.storage.lint_repo import insert_lint_finding_row
+from llm_wiki.storage.links_repo import (
+    delete_links_for_slug,
+    get_link_targets_for_source,
+    list_all_links,
+    replace_links_for_source,
+)
+from llm_wiki.storage.notes_repo import (
+    delete_note_row,
+    get_note_row_by_slug,
+    insert_note_row,
+    list_note_rows,
+    update_note_row,
+)
 from llm_wiki.storage.queue_repo import (
     get_queue_row,
     insert_queue_row,
@@ -35,4 +48,11 @@ __all__ = [
     "insert_note_row",
     "get_note_row_by_slug",
     "update_note_row",
+    "list_note_rows",
+    "delete_note_row",
+    "replace_links_for_source",
+    "get_link_targets_for_source",
+    "delete_links_for_slug",
+    "list_all_links",
+    "insert_lint_finding_row",
 ]

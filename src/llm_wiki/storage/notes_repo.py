@@ -4,7 +4,10 @@ Same pattern as `queue_repo`/`chunk_repo`: no internal `.commit()`,
 callers own the transaction boundary. `compiler.write_source_note()`
 (INGEST_PLAN.md §11) inserts a note row and its chunk/embedding rows in
 one `with storage.conn:` block, alongside the queue item's terminal
-status write in `ingest.cascade()`.
+status write in `ingest.cascade()`. `list_note_rows()`/`delete_note_row()`
+(GRAPH_LINT_PLAN.md §2) support `graph.rebuild_links()`'s filesystem
+reconciliation — deletion detection and the isolated-note check need
+every row, not just a slug lookup.
 """
 
 from __future__ import annotations
@@ -49,21 +52,26 @@ def get_note_row_by_slug(storage: StorageEngine, slug: str) -> Note | None:
 def update_note_row(storage: StorageEngine, note: Note) -> Note:
     """Update an existing `notes` row in place, by `id`.
 
-    Only `tags`/`sources`/`content_hash`/`updated_at` are expected to
-    change post-creation — `path`/`slug`/`type`/`title` are set once at
-    creation and never rewritten here. Used by
-    `compiler.fan_out_mentions()`'s repeat-mention append path
-    (INGEST_PLAN.md §12); the caller is responsible for having already
-    merged the new `sources` entry and recomputed `content_hash` before
-    calling this.
+    Updates every mutable field (`type`/`title`/`tags`/`sources`/
+    `content_hash`/`updated_at`) — `path`/`slug`/`id`/`created_at` never
+    change post-creation. Originally written narrower (only `tags`/
+    `sources`/`content_hash`/`updated_at`) for `compiler.fan_out_mentions()`'s
+    repeat-mention append path (INGEST_PLAN.md §12), which never changes
+    `type`/`title` anyway — broadened for `graph.rebuild_links()`
+    (GRAPH_LINT_PLAN.md §2), which reconciles a hand-edited note's
+    frontmatter wholesale and may find `type`/`title` genuinely changed.
+    Safe for both callers: one just always passes through its unchanged
+    values for the newly-covered fields.
     """
     storage.conn.execute(
         """
         UPDATE notes
-        SET tags = ?, sources = ?, content_hash = ?, updated_at = ?
+        SET type = ?, title = ?, tags = ?, sources = ?, content_hash = ?, updated_at = ?
         WHERE id = ?;
         """,
         (
+            note.type.value,
+            note.title,
             json.dumps(note.tags),
             json.dumps(note.sources),
             note.content_hash,
@@ -72,6 +80,23 @@ def update_note_row(storage: StorageEngine, note: Note) -> Note:
         ),
     )
     return note
+
+
+def list_note_rows(storage: StorageEngine) -> list[Note]:
+    """Every `notes` row. Used by `graph.rebuild_links()`'s deletion
+    detection (check each row's `path` still exists on disk) and
+    `lint.run()`'s isolated-note check (GRAPH_LINT_PLAN.md §2/§3)."""
+    rows = storage.conn.execute("SELECT * FROM notes;").fetchall()
+    return [_row_to_note(row) for row in rows]
+
+
+def delete_note_row(storage: StorageEngine, note_id: int) -> None:
+    """Delete a `notes` row (cascades to its `chunks` via the existing
+    FK). Does **not** touch `links` — `links` has no FK to `notes` by
+    design (a link's target may legitimately not exist yet), so the
+    caller is responsible for cleaning up any `links` rows mentioning
+    this note's slug (`links_repo.delete_links_for_slug()`)."""
+    storage.conn.execute("DELETE FROM notes WHERE id = ?;", (note_id,))
 
 
 def _row_to_note(row) -> Note:

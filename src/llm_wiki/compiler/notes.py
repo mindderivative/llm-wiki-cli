@@ -16,13 +16,12 @@ Both functions raise rather than catching their own failures — same
 
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 
 import frontmatter
 
 from llm_wiki.llm.client import LlmClient
-from llm_wiki.models import Analysis, Chunk, Mention, Note, NoteType, QueueItem, utcnow
+from llm_wiki.models import NOTE_TYPE_FOLDERS, Analysis, Chunk, Mention, Note, NoteType, QueueItem, utcnow
 from llm_wiki.storage import (
     StorageEngine,
     get_note_row_by_slug,
@@ -31,14 +30,7 @@ from llm_wiki.storage import (
     insert_note_row,
     update_note_row,
 )
-from llm_wiki.textutil import slugify
-
-_FOLDER_FOR_TYPE = {
-    NoteType.SOURCE: "sources",
-    NoteType.ENTITY: "entities",
-    NoteType.CONCEPT: "concepts",
-    NoteType.SYNTHESIS: "synthesis",
-}
+from llm_wiki.textutil import content_hash, slugify
 
 
 def write_source_note(
@@ -71,7 +63,7 @@ def write_source_note(
         title=item.title,
         tags=[],
         sources=[item.title],
-        content_hash=_sha256_text(text),
+        content_hash=content_hash(text),
     )
     inserted = insert_note_row(storage, note)
 
@@ -177,7 +169,7 @@ def _create_mention_note(
         title=mention.name,
         tags=[],
         sources=[item.title],
-        content_hash=_sha256_text(text),
+        content_hash=content_hash(text),
     )
     inserted = insert_note_row(storage, note)
 
@@ -224,7 +216,7 @@ def _append_mention(
     _write_atomic(existing.path, text)
 
     updated = existing.model_copy(
-        update={"sources": new_sources, "content_hash": _sha256_text(text), "updated_at": utcnow()}
+        update={"sources": new_sources, "content_hash": content_hash(text), "updated_at": utcnow()}
     )
     return update_note_row(storage, updated)
 
@@ -287,8 +279,4 @@ def _unique_slug(storage: StorageEngine, vault_root: Path, note_type: NoteType, 
 
 
 def _note_path(vault_root: Path, note_type: NoteType, slug: str) -> Path:
-    return vault_root / "wiki" / _FOLDER_FOR_TYPE[note_type] / f"{slug}.md"
-
-
-def _sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return vault_root / "wiki" / NOTE_TYPE_FOLDERS[note_type] / f"{slug}.md"

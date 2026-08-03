@@ -1,16 +1,18 @@
-"""Thin `typer` CLI onto `VaultManager`, `stager`, `ingest`, `llm`, and
-`vcs` (ARCHITECTURE.md §7, §9; INGEST_PLAN.md §6).
+"""Thin `typer` CLI onto `VaultManager`, `stager`, `ingest`, `llm`,
+`vcs`, `graph`, and `lint` (ARCHITECTURE.md §7, §9; INGEST_PLAN.md §6;
+GRAPH_LINT_PLAN.md §4).
 
 `vault` exposes what `VaultManager` does (create/load/validate/
 list-recent/forget). `ingest` composes `stager` + `ingest`'s functions —
 `add` stages, `step`/`run` advance the pipeline (INGEST_PLAN.md §4/§5).
 `step`/`run` build a `LlamaClient` + dispatch table per invocation
-(`_dispatch_table()` below) so `compile()` (INGEST_PLAN.md §10) gets
-driven the same way as every other step, without the CLI hardcoding
-which status needs an LLM. `run` also does the batch-end commit via
-`vcs.GitEngine` once at least one item reaches `COMPLETED` during the
-run — see `_ingest_commit_message()` below. No `lint`/`graph` commands
-yet; those land once the corresponding subpackages exist.
+(`_dispatch_table()` below) so `compile()`/`cascade()` get driven the
+same way as every other step, without the CLI hardcoding which status
+needs an LLM. `run` also does the batch-end commit via `vcs.GitEngine`
+once at least one item reaches `COMPLETED` during the run — see
+`_ingest_commit_message()` below. `graph rebuild`/`lint run` are
+separate, manually-invoked commands, not wired into `ingest run`
+(GRAPH_LINT_PLAN.md §0 decision 1).
 
 Run via `python -m llm_wiki <command>` (see `__main__.py`). Not wired up
 as a `[project.scripts]` console entry point yet, since the shared
@@ -28,7 +30,9 @@ from rich.console import Console
 from rich.table import Table
 
 from llm_wiki.config import VaultSettings
+from llm_wiki.graph import rebuild_links
 from llm_wiki.ingest import advance, build_pipeline, step_once
+from llm_wiki.lint import run as lint_run
 from llm_wiki.llm import LlamaClient
 from llm_wiki.models import QueueItem, QueueStatus, VaultAlreadyExistsError, VaultNotFoundError
 from llm_wiki.stager import stage, verify_and_clean
@@ -45,6 +49,10 @@ vault_app = typer.Typer(help="Create, inspect, and validate vaults.", no_args_is
 app.add_typer(vault_app, name="vault")
 ingest_app = typer.Typer(help="Stage files and drive them through the pipeline.", no_args_is_help=True)
 app.add_typer(ingest_app, name="ingest")
+graph_app = typer.Typer(help="Maintain the wiki's [[wikilink]] graph.", no_args_is_help=True)
+app.add_typer(graph_app, name="graph")
+lint_app = typer.Typer(help="Validate the wiki and report health.", no_args_is_help=True)
+app.add_typer(lint_app, name="lint")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -250,8 +258,8 @@ def ingest_status(
     table.add_row("updated_at", item.updated_at.isoformat())
     if analysis is not None:
         table.add_row("summary", analysis.summary)
-        table.add_row("entities", ", ".join(analysis.entities))
-        table.add_row("concepts", ", ".join(analysis.concepts))
+        table.add_row("entities", ", ".join(m.name for m in analysis.entities))
+        table.add_row("concepts", ", ".join(m.name for m in analysis.concepts))
     console.print(table)
 
 
@@ -416,6 +424,68 @@ def ingest_run(
 
     if failed_item is not None:
         raise typer.Exit(code=1)
+
+
+@graph_app.command("rebuild")
+def graph_rebuild(
+    full: bool = typer.Option(
+        False, "--full", help="Reprocess every note, even ones whose content_hash hasn't changed."
+    ),
+    vault: Path = _VAULT_OPTION,
+) -> None:
+    """Reconcile notes/links against wiki/'s current on-disk state.
+
+    Incremental by default — only notes that are new, changed, or
+    deleted since the last run get touched. Also discovers hand-authored
+    notes that were never created via `ingest`/`compiler`
+    (GRAPH_LINT_PLAN.md §2).
+    """
+    with _open_vault(vault) as (settings, storage):
+        result = rebuild_links(settings.vault_root, storage, full=full)
+
+    table = Table(show_header=False)
+    table.add_row("notes_scanned", str(result.notes_scanned))
+    table.add_row("notes_indexed", str(result.notes_indexed))
+    table.add_row("notes_updated", str(result.notes_updated))
+    table.add_row("notes_deleted", str(result.notes_deleted))
+    table.add_row("links_added", str(result.links_added))
+    table.add_row("links_removed", str(result.links_removed))
+    console.print(table)
+
+    if result.notes_unreadable:
+        console.print(
+            f"[yellow]{len(result.notes_unreadable)} note(s) skipped — "
+            "unreadable frontmatter:[/yellow]"
+        )
+        for slug in result.notes_unreadable:
+            console.print(f"  - {slug}")
+
+
+@lint_app.command("run")
+def lint_run_command(vault: Path = _VAULT_OPTION) -> None:
+    """Validate the wiki: broken links, isolated notes, frontmatter
+    schema violations, and a health score.
+
+    Reads notes/links as of the last `graph rebuild` — does not rebuild
+    the graph itself (GRAPH_LINT_PLAN.md §0 decision 1). Run `graph
+    rebuild` first if `wiki/` has changed since.
+    """
+    with _open_vault(vault) as (settings, storage):
+        report = lint_run(settings.vault_root, storage)
+
+    console.print(f"run_id: {report.run_id}")
+    console.print(f"notes checked: {report.total_notes}")
+    console.print(f"health score: {report.health_score:.0%}")
+
+    if not report.findings:
+        console.print("[green]No findings.[/green]")
+        return
+
+    table = Table("Kind", "Slug", "Message")
+    for finding in report.findings:
+        table.add_row(finding.kind, finding.slug, finding.message)
+    console.print(table)
+    raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

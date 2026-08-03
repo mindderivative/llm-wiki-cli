@@ -274,6 +274,32 @@ def test_status_shows_analysis_once_analyzed(tmp_path: Path, vault_root: Path, w
     assert "a summary" in result.stdout
 
 
+def test_status_shows_entity_and_concept_names(tmp_path: Path, vault_root: Path, monkeypatch):
+    # Regression test: `analysis.entities`/`.concepts` became `list[Mention]`
+    # (INGEST_PLAN.md §12) -- `ingest status` used to do a bare
+    # `", ".join(analysis.entities)`, which raised a TypeError the moment
+    # entities actually held `Mention`s instead of strings. Caught and
+    # fixed while building `graph`/`lint` (GRAPH_LINT_PLAN.md).
+    class FakeLlmClientWithMentions(FakeLlmClient):
+        def extract(self, text: str) -> ExtractionResult:
+            from llm_wiki.models import Mention
+
+            return ExtractionResult(
+                entities=[Mention(name="Acme Corp", note="n")],
+                concepts=[Mention(name="supply chain", note="n")],
+            )
+
+    monkeypatch.setattr(cli_module, "LlamaClient", lambda config: FakeLlmClientWithMentions())
+    _add(vault_root, _write(tmp_path, "note.txt"))
+    runner.invoke(app, ["ingest", "run", "1", "--vault", str(vault_root)])
+
+    result = runner.invoke(app, ["ingest", "status", "1", "--vault", str(vault_root)])
+
+    assert result.exit_code == 0
+    assert "Acme Corp" in result.stdout
+    assert "supply chain" in result.stdout
+
+
 def test_run_invalid_count_fails(vault_root: Path):
     result = runner.invoke(app, ["ingest", "run", "--count", "not-a-number", "--vault", str(vault_root)])
 

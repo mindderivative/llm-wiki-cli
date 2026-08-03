@@ -56,6 +56,19 @@ class NoteType(str, enum.Enum):
     SYNTHESIS = "synthesis"
 
 
+NOTE_TYPE_FOLDERS: dict[NoteType, str] = {
+    NoteType.SOURCE: "sources",
+    NoteType.ENTITY: "entities",
+    NoteType.CONCEPT: "concepts",
+    NoteType.SYNTHESIS: "synthesis",
+}
+"""`NoteType` -> its `wiki/` subdirectory name (ARCHITECTURE.md §5).
+Single source of truth for both `compiler` (writing a note into the
+right folder) and `graph` (walking every folder to find notes to
+reconcile, GRAPH_LINT_PLAN.md §2) — previously duplicated privately in
+`compiler/notes.py` before `graph` became a second real consumer."""
+
+
 # --------------------------------------------------------------------------
 # Table-backed domain models (ARCHITECTURE.md §6)
 # --------------------------------------------------------------------------
@@ -155,11 +168,36 @@ class Link(BaseModel):
 class LintFinding(BaseModel):
     """One issue surfaced by a lint run (`lint_findings` table)."""
 
+    id: int | None = None
     run_id: str
     slug: str
     kind: str  # "broken_link" | "schema_violation" | "isolated_note" | ...
     message: str
     created_at: datetime = Field(default_factory=utcnow)
+
+
+class LinkRebuildResult(BaseModel):
+    """Return shape of `graph.rebuild_links()` — not table-backed, just a
+    summary of one rebuild pass for the CLI to print (GRAPH_LINT_PLAN.md
+    §2)."""
+
+    notes_scanned: int = 0
+    notes_indexed: int = 0  # newly discovered (no prior `notes` row)
+    notes_updated: int = 0  # existing row, content_hash had changed
+    notes_deleted: int = 0  # DB row existed, file gone from disk
+    notes_unreadable: list[str] = Field(default_factory=list)  # slugs with unparseable frontmatter
+    links_added: int = 0
+    links_removed: int = 0
+
+
+class LintReport(BaseModel):
+    """Return shape of `lint.run()` — not table-backed, just a summary of
+    one lint pass for the CLI to print (GRAPH_LINT_PLAN.md §3)."""
+
+    run_id: str
+    findings: list[LintFinding] = Field(default_factory=list)
+    total_notes: int
+    health_score: float  # 1 - (distinct notes with >=1 finding / total_notes); 1.0 when total_notes == 0
 
 
 # --------------------------------------------------------------------------
